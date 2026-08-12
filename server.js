@@ -9,7 +9,10 @@ const OpenAI = require('openai');
 
 const app = express();
 app.use(express.json());
-
+app.use(cors()); 
+app.get('/', (req, res) => {
+  res.send('AstarsD Backend is live!');
+});
 // ============ CORS – allow your domains ============
 app.use(cors({
   origin: [
