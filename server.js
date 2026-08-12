@@ -1,0 +1,1140 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
+const OpenAI = require('openai');
+
+const app = express();
+app.use(express.json());
+
+// ============ CORS – allow your domains ============
+app.use(cors({
+  origin: [
+    'https://astarsd.app',
+    'https://api.astarsd.app',
+    'http://localhost:3000',   // React dev
+    'http://localhost:8081'    // React Native local
+  ],
+  credentials: true
+}));
+
+// ============ CONNECT DATABASE ============
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/AstarsD')
+  .then(() => console.log('✅ MongoDB Connected'))
+  .catch(err => console.error('❌ MongoDB Error:', err));
+
+// ============ OPENAI ============
+const openai = new OpenAI({ 
+  apiKey: process.env.OPENAI_API_KEY 
+});
+
+// ============ ALL LANGUAGES ============
+const SUPPORTED_LANGUAGES = {
+  'en-US': { name: 'English (US)', code: 'en-US', flag: '🇺🇸' },
+  'en-GB': { name: 'English (UK)', code: 'en-GB', flag: '🇬🇧' },
+  'it': { name: 'Italiano', code: 'it', flag: '🇮🇹' },
+  'de': { name: 'Deutsch', code: 'de', flag: '🇩🇪' },
+  'fr': { name: 'Français', code: 'fr', flag: '🇫🇷' },
+  'es': { name: 'Español', code: 'es', flag: '🇪🇸' },
+  'sq': { name: 'Shqip', code: 'sq', flag: '🇦🇱' },
+  'bs': { name: 'Bosanski', code: 'bs', flag: '🇧🇦' },
+  'hr': { name: 'Hrvatski', code: 'hr', flag: '🇭🇷' },
+  'sr': { name: 'Srpski', code: 'sr', flag: '🇷🇸' },
+  'mk': { name: 'Македонски', code: 'mk', flag: '🇲🇰' },
+};
+
+const LANGUAGE_PROMPTS = {
+  'en-US': 'Write the reply in American English.',
+  'en-GB': 'Write the reply in British English.',
+  'it': 'Scrivi la risposta in Italiano.',
+  'de': 'Schreibe die Antwort auf Deutsch.',
+  'fr': 'Écris la réponse en Français.',
+  'es': 'Escribe la respuesta en Español.',
+  'sq': 'Shkruani përgjigjen në Shqip.',
+  'bs': 'Napišite odgovor na Bosanskom.',
+  'hr': 'Napišite odgovor na Hrvatskom.',
+  'sr': 'Напишите одговор на Српском.',
+  'mk': 'Напишете одговор на Македонски.',
+};
+
+// ============ EMAIL TRANSPORTER – SMTP from .env ============
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.SMTP_PORT || '587'),
+  secure: process.env.SMTP_SECURE === 'true',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+async function sendVerificationEmail(to, code, businessName) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #1A2A3A; color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f5f5f5; padding: 30px; border-radius: 0 0 10px 10px; }
+        .code { font-size: 36px; font-weight: bold; color: #1A2A3A; text-align: center; padding: 20px; background: white; border-radius: 10px; margin: 20px 0; letter-spacing: 8px; }
+        .footer { text-align: center; color: #999; font-size: 12px; margin-top: 20px; }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>🌍 AstarsD</h1>
+      </div>
+      <div class="content">
+        <h2>Hello ${businessName || 'there'}! 👋</h2>
+        <p>Thank you for signing up! Please verify your email address.</p>
+        <div class="code">${code}</div>
+        <p>This code expires in <strong>5 minutes</strong>.</p>
+        <p>If you didn't request this, please ignore this email.</p>
+      </div>
+      <div class="footer">
+        <p>© 2024 AstarsD. All rights reserved.</p>
+      </div>
+    </body>
+    </html>
+  `;
+
+  await transporter.sendMail({
+    from: `"AstarsD" <${process.env.EMAIL_USER}>`,
+    to,
+    subject: 'Verify Your Email - AstarsD',
+    html,
+  });
+}
+
+// ============ MODELS ============
+const UserSchema = new mongoose.Schema({
+  email: { type: String, unique: true, required: true },
+  password: { type: String, required: true },
+  businessName: String,
+  phone: String,
+  preferredLanguage: { type: String, default: 'en-US', enum: Object.keys(SUPPORTED_LANGUAGES) },
+  trialEnds: { type: Date, default: () => new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) },
+  isSubscribed: { type: Boolean, default: false },
+  subscriptionPlan: { type: String, enum: ['single', 'pro', 'business', null], default: null },
+  subscriptionStart: { type: Date, default: null },
+  subscriptionEnds: { type: Date, default: null },
+  repliesUsed: { type: Number, default: 0 },
+  monthlyLimit: { type: Number, default: 50 },
+  createdAt: { type: Date, default: Date.now },
+  isVerified: { type: Boolean, default: false },
+  verificationCode: { type: String },
+  verificationCodeExpires: { type: Date },
+  pendingEmail: { type: String },
+  pendingEmailCode: { type: String },
+  pendingEmailCodeExpires: { type: Date },
+  plan: { type: String, default: 'single' },
+});
+const User = mongoose.model('User', UserSchema);
+
+const BusinessSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  name: { type: String, required: true },
+  platform: { type: String, enum: ['google', 'facebook', 'yelp', 'other'], default: 'other' },
+  externalId: { type: String },
+  accessToken: { type: String },
+  lastSyncedAt: { type: Date, default: null },
+  createdAt: { type: Date, default: Date.now }
+});
+const Business = mongoose.model('Business', BusinessSchema);
+
+const ReviewSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
+  reviewerName: String,
+  reviewerEmail: String,
+  rating: { type: Number, min: 1, max: 5 },
+  content: { type: String, required: true },
+  contentLanguage: { type: String, default: 'en-US' },
+  platform: { type: String, enum: ['google', 'facebook', 'yelp', 'other'], default: 'other' },
+  isFake: { type: Boolean, default: false },
+  fraudScore: { type: Number, default: 0 },
+  status: { type: String, enum: ['pending', 'ai_draft', 'waiting_approval', 'sent', 'rejected'], default: 'pending' },
+  externalReviewId: { type: String, unique: true, sparse: true },
+  createdAt: { type: Date, default: Date.now }
+});
+const Review = mongoose.model('Review', ReviewSchema);
+
+const ReplySchema = new mongoose.Schema({
+  reviewId: { type: mongoose.Schema.Types.ObjectId, ref: 'Review', required: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  draft: { type: String, required: true },
+  final: String,
+  language: { type: String, default: 'en-US' },
+  status: { type: String, enum: ['draft', 'approved', 'edited', 'sent', 'rejected'], default: 'draft' },
+  approvedAt: Date,
+  sentAt: Date,
+  editHistory: [String],
+  createdAt: { type: Date, default: Date.now }
+});
+const Reply = mongoose.model('Reply', ReplySchema);
+
+// ============ MIDDLEWARE ============
+const auth = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) throw new Error();
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+    const user = await User.findById(decoded.id);
+    if (!user) throw new Error();
+    req.user = user;
+    next();
+  } catch (error) {
+    res.status(401).json({ success: false, message: 'Please authenticate' });
+  }
+};
+
+const checkAccess = async (req, res, next) => {
+  const user = req.user;
+  const isTrialValid = user.trialEnds > new Date();
+  const hasSubscription = user.isSubscribed;
+  const underLimit = user.repliesUsed < user.monthlyLimit;
+  if (!isTrialValid && !hasSubscription && !underLimit) {
+    return res.status(403).json({
+      success: false,
+      message: 'Free trial expired. Please subscribe to continue.',
+      trialEnded: true
+    });
+  }
+  next();
+};
+
+// ============ HELPER: Consistent user response ============
+const getUserResponse = (user) => {
+  let subscriptionDaysLeft = 0;
+  if (user.isSubscribed && user.subscriptionEnds) {
+    subscriptionDaysLeft = Math.max(0, Math.ceil((user.subscriptionEnds - new Date()) / (1000 * 60 * 60 * 24)));
+  } else if (user.trialEnds) {
+    subscriptionDaysLeft = Math.max(0, Math.ceil((user.trialEnds - new Date()) / (1000 * 60 * 60 * 24)));
+  }
+  return {
+    id: user._id,
+    email: user.email,
+    businessName: user.businessName,
+    plan: user.plan,
+    isVerified: user.isVerified,
+    trialEnds: user.trialEnds,
+    isSubscribed: user.isSubscribed,
+    subscriptionDaysLeft,
+    repliesUsed: user.repliesUsed,
+    monthlyLimit: user.monthlyLimit,
+    preferredLanguage: user.preferredLanguage,
+  };
+};
+
+// ============ SERVICES ============
+
+function detectLanguage(text) {
+  const patterns = {
+    'en-US': /\b(the|and|for|with|you|your|review|service|great|good|best|color|center|organize)\b/i,
+    'en-GB': /\b(the|and|for|with|you|your|review|service|great|good|best|colour|centre|organise)\b/i,
+    'it': /\b(il|lo|la|e|per|con|tu|tuo|recensione|servizio|ottimo|buono|migliore|grazie)\b/i,
+    'de': /\b(der|die|das|und|für|mit|sie|ihr|bewertung|service|großartig|gut|beste|danke)\b/i,
+    'fr': /\b(le|la|les|et|pour|avec|vous|votre|avis|service|excellent|bon|meilleur|merci)\b/i,
+    'es': /\b(el|la|los|las|y|para|con|usted|su|reseña|servicio|excelente|bueno|mejor|gracias)\b/i,
+    'sq': /\b(dhe|për|me|ju|juaj|shërbim|shqyrtim|mirë|më|i|të|faleminderit)\b/i,
+    'bs': /\b(i|sa|za|sa|vas|vaš|usluga|recenzija|odličan|dobar|najbolji|hvala)\b/i,
+    'hr': /\b(i|sa|za|vas|vaš|usluga|recenzija|odličan|dobar|najbolji|hvala)\b/i,
+    'sr': /\b(и|са|за|вас|ваш|услуга|рецензија|одличан|добар|најбољи|хвала)\b/i,
+    'mk': /\b(и|со|за|вас|ваш|услуга|рецензија|одличен|добар|најдобар|благодарам)\b/i,
+  };
+  let detected = 'en-US';
+  let maxScore = 0;
+  for (const [lang, pattern] of Object.entries(patterns)) {
+    const matches = (text.match(pattern) || []).length;
+    if (matches > maxScore) {
+      maxScore = matches;
+      detected = lang;
+    }
+  }
+  return detected;
+}
+
+async function generateAIReply(reviewContent, rating, language = 'en-US') {
+  try {
+    const languageInstruction = LANGUAGE_PROMPTS[language] || LANGUAGE_PROMPTS['en-US'];
+    let toneInstruction = '';
+    if (rating >= 4) toneInstruction = 'Write a warm, appreciative reply thanking the customer for their positive feedback.';
+    else if (rating >= 3) toneInstruction = 'Write a balanced reply acknowledging their feedback and showing appreciation.';
+    else toneInstruction = 'Write a professional, apologetic reply addressing their concerns and showing commitment to improvement.';
+    const prompt = `Write a professional reply to this ${rating}-star review:
+
+Review: "${reviewContent}"
+
+Instructions:
+- ${toneInstruction}
+- Address the reviewer's specific points
+- Keep it under 150 words
+- Be professional and genuine
+- ${languageInstruction}
+- IMPORTANT: The reply MUST be in the same language as the review
+
+Reply:`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4',
+      messages: [
+        { role: 'system', content: `You are a professional customer service representative. You write replies in the EXACT SAME LANGUAGE as the review you're responding to. ${languageInstruction}` },
+        { role: 'user', content: prompt }
+      ],
+      max_tokens: 300,
+      temperature: 0.7
+    });
+    return { success: true, content: response.choices[0].message.content.trim(), language };
+  } catch (error) {
+    console.error('OpenAI Error:', error);
+    const fallbackReplies = {
+      'en-US': `Thank you for your ${rating}-star review. We appreciate your feedback and will use it to improve our services.`,
+      'en-GB': `Thank you for your ${rating}-star review. We appreciate your feedback and will use it to improve our services.`,
+      'it': `Grazie per la tua recensione da ${rating} stelle. Apprezziamo il tuo feedback e lo useremo per migliorare i nostri servizi.`,
+      'de': `Vielen Dank für Ihre ${rating}-Sterne-Bewertung. Wir schätzen Ihr Feedback und werden es nutzen, um unsere Dienstleistungen zu verbessern.`,
+      'fr': `Merci pour votre avis ${rating} étoiles. Nous apprécions vos commentaires et les utiliserons pour améliorer nos services.`,
+      'es': `Gracias por tu reseña de ${rating} estrellas. Apreciamos tus comentarios y los usaremos para mejorar nuestros servicios.`,
+      'sq': `Faleminderit për vlerësimin tuaj me ${rating} yje. E vlerësojmë reagimin tuaj dhe do ta përdorim për të përmirësuar shërbimet tona.`,
+      'bs': `Hvala vam za vašu ocjenu od ${rating} zvjezdica. Cijenimo vašu povratnu informaciju i koristit ćemo je za poboljšanje naših usluga.`,
+      'hr': `Hvala vam za vašu ocjenu od ${rating} zvjezdica. Cijenimo vašu povratnu informaciju i koristit ćemo je za poboljšanje naših usluga.`,
+      'sr': `Хвала вам за вашу оцену од ${rating} звездица. Ценимо вашу повратну информацију и користићемо је за побољшање наших услуга.`,
+      'mk': `Ви благодариме за вашата оценка од ${rating} ѕвезди. Ја цениме вашата повратна информација и ќе ја искористиме за подобрување на нашите услуги.`
+    };
+    return { success: false, content: fallbackReplies[language] || fallbackReplies['en-US'], language };
+  }
+}
+
+function detectFakeReviewer(review) {
+  let score = 0, reasons = [];
+  const content = review.content || '';
+  if (content.length < 15) { score += 25; reasons.push('Review too short'); }
+  const genericPatterns = [
+    /great|amazing|excellent|good|nice|best|awesome/i,
+    /ottimo|eccellente|buono|migliore/i,
+    /großartig|ausgezeichnet|gut|beste/i,
+    /excellent|bon|meilleur/i,
+    /excelente|bueno|mejor/i,
+    /shkëlqyeshëm|mirë|më i mirë/i,
+    /odličan|dobar|najbolji/i,
+    /одличан|добар|најбољи/i,
+    /одличен|добар|најдобар/i
+  ];
+  let genericCount = 0;
+  genericPatterns.forEach(p => { if (p.test(content)) genericCount++; });
+  if (genericCount > 2) { score += 20; reasons.push('Too many generic phrases'); }
+  if (content === content.toUpperCase() && content.length > 10) { score += 15; reasons.push('All caps text'); }
+  if ((content.match(/!{3,}/g) || []).length > 2) { score += 15; reasons.push('Excessive exclamation marks'); }
+  if (review.reviewerEmail) {
+    const email = review.reviewerEmail.toLowerCase();
+    if (email.includes('temp') || email.includes('fake') || email.includes('test')) {
+      score += 20; reasons.push('Suspicious email domain');
+    }
+  }
+  if (review.rating === 5 && content.length < 30) { score += 10; reasons.push('Perfect rating without detail'); }
+  return { isFake: score > 35, score, reasons };
+}
+
+// ============ EXTERNAL REVIEW FETCHER ============
+async function fetchExternalReviews(business) {
+  console.log(`🔍 Fetching reviews for ${business.name} (${business.platform})`);
+  
+  // GOOGLE
+  if (business.platform === 'google') {
+    try {
+      const apiKey = process.env.GOOGLE_API_KEY;
+      const placeId = business.externalId;
+      if (!apiKey) { console.error('❌ GOOGLE_API_KEY not set'); return []; }
+      if (!placeId) { console.error('❌ No Place ID'); return []; }
+      const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&key=${apiKey}&fields=name,rating,reviews,user_ratings_total`;
+      const response = await fetch(url);
+      const data = await response.json();
+      if (data.status !== 'OK') { console.error('❌ Google API Error:', data.status); return []; }
+      if (!data.result?.reviews || data.result.reviews.length === 0) { console.log(`ℹ️ No reviews on Google`); return []; }
+      console.log(`✅ Found ${data.result.reviews.length} reviews on Google`);
+      return data.result.reviews.map((review) => ({
+        externalReviewId: `google_${placeId}_${review.time}_${review.author_name}`,
+        reviewerName: review.author_name || 'Anonymous',
+        reviewerEmail: '',
+        rating: review.rating || 0,
+        content: review.text || '',
+        platform: 'google',
+      }));
+    } catch (error) {
+      console.error('❌ Google API Error:', error.message);
+      return [];
+    }
+  }
+  
+  // FACEBOOK
+  if (business.platform === 'facebook') {
+    try {
+      const accessToken = business.accessToken || process.env.FACEBOOK_ACCESS_TOKEN;
+      const pageId = business.externalId;
+      if (!accessToken) { console.error('❌ Facebook Access Token not set'); return []; }
+      if (!pageId) { console.error('❌ No Page ID'); return []; }
+      const url = `https://graph.facebook.com/v18.0/${pageId}/ratings?access_token=${accessToken}&fields=reviewer{name,email},rating,review_text,created_time,recommendation_type`;
+      const response = await fetch(url);
+      const data = await response.json();
+      if (data.error) { console.error('❌ Facebook API Error:', data.error.message); return []; }
+      if (!data.data || data.data.length === 0) { console.log(`ℹ️ No reviews on Facebook`); return []; }
+      console.log(`✅ Found ${data.data.length} reviews on Facebook`);
+      return data.data.map((review) => ({
+        externalReviewId: `fb_${review.id}`,
+        reviewerName: review.reviewer?.name || 'Anonymous',
+        reviewerEmail: review.reviewer?.email || '',
+        rating: review.rating || (review.recommendation_type === 'positive' ? 5 : 1),
+        content: review.review_text || '',
+        platform: 'facebook',
+      }));
+    } catch (error) {
+      console.error('❌ Facebook API Error:', error.message);
+      return [];
+    }
+  }
+  
+  // YELP
+  if (business.platform === 'yelp') {
+    try {
+      const apiKey = business.accessToken || process.env.YELP_API_KEY;
+      const businessId = business.externalId;
+      if (!apiKey) { console.error('❌ Yelp API Key not set'); return []; }
+      if (!businessId) { console.error('❌ No Business ID'); return []; }
+      const url = `https://api.yelp.com/v3/businesses/${businessId}/reviews?limit=20&sort_by=newest`;
+      const response = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+      const data = await response.json();
+      if (data.error) { console.error('❌ Yelp API Error:', data.error.description); return []; }
+      if (!data.reviews || data.reviews.length === 0) { console.log(`ℹ️ No reviews on Yelp`); return []; }
+      console.log(`✅ Found ${data.reviews.length} reviews on Yelp`);
+      return data.reviews.map((review) => ({
+        externalReviewId: `yelp_${review.id}`,
+        reviewerName: review.user?.name || 'Anonymous',
+        reviewerEmail: '',
+        rating: review.rating || 0,
+        content: review.text || '',
+        platform: 'yelp',
+      }));
+    } catch (error) {
+      console.error('❌ Yelp API Error:', error.message);
+      return [];
+    }
+  }
+  
+  console.log(`⚠️ Platform "${business.platform}" not yet integrated`);
+  return [];
+}
+
+// ============ ROUTES ============
+
+// ---------- AUTH ----------
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, businessName, phone, preferredLanguage, plan } = req.body;
+    const existingUser = await User.findOne({ email });
+    if (existingUser) return res.status(400).json({ success: false, message: 'Email already registered' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+    const user = new User({
+      email,
+      password: hashedPassword,
+      businessName,
+      phone,
+      preferredLanguage: preferredLanguage || 'en-US',
+      plan: plan || 'single',
+      isVerified: true,
+      verificationCode,
+      verificationCodeExpires: Date.now() + 300000,
+      trialEnds: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
+    });
+    await user.save();
+    await sendVerificationEmail(email, verificationCode, businessName);
+
+    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+
+    res.status(201).json({
+      success: true,
+      message: 'Account created! 14-day free trial started.',
+      token,
+      user: getUserResponse(user)
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/api/auth/verify', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ success: false, message: 'User not found' });
+    if (user.isVerified) return res.status(400).json({ success: false, message: 'Email already verified' });
+    if (user.verificationCode !== code) return res.status(400).json({ success: false, message: 'Invalid verification code' });
+    if (Date.now() > user.verificationCodeExpires) return res.status(400).json({ success: false, message: 'Code expired. Please request a new one.' });
+
+    user.isVerified = true;
+    user.verificationCode = null;
+    user.verificationCodeExpires = null;
+    await user.save();
+
+    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+    res.json({
+      success: true,
+      message: 'Email verified successfully!',
+      token,
+      user: getUserResponse(user)
+    });
+  } catch (error) {
+    console.error('Verification error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/api/auth/resend-code', async (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ success: false, message: 'User not found' });
+    if (user.isVerified) return res.status(400).json({ success: false, message: 'Email already verified' });
+
+    const newCode = Math.floor(100000 + Math.random() * 900000).toString();
+    user.verificationCode = newCode;
+    user.verificationCodeExpires = Date.now() + 300000;
+    await user.save();
+    await sendVerificationEmail(email, newCode, user.businessName);
+    res.json({ success: true, message: 'New verification code sent to your email' });
+  } catch (error) {
+    console.error('Resend code error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- LOGIN ----------
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+    if (!user.isVerified) {
+      if (!user.verificationCode) {
+        user.isVerified = true;
+        await user.save();
+      } else {
+        return res.status(403).json({
+          success: false,
+          message: 'Please verify your email first. A verification code was sent to your email.',
+          needsVerification: true,
+          email: user.email
+        });
+      }
+    }
+
+    const isValid = await bcrypt.compare(password, user.password);
+    if (!isValid) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+    res.json({
+      success: true,
+      token,
+      user: getUserResponse(user)
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- USER ROUTES ----------
+app.post('/api/user/change-email', auth, async (req, res) => {
+  try {
+    const { newEmail } = req.body;
+    const userId = req.user.id;
+    const existing = await User.findOne({ email: newEmail });
+    if (existing) return res.status(400).json({ success: false, message: 'Email already in use' });
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const user = await User.findById(userId);
+    user.pendingEmail = newEmail;
+    user.pendingEmailCode = code;
+    user.pendingEmailCodeExpires = Date.now() + 300000;
+    await user.save();
+    await sendVerificationEmail(newEmail, code, user.businessName);
+    res.json({ success: true, message: 'Verification code sent to new email' });
+  } catch (error) {
+    console.error('Change email error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/api/user/verify-email-change', auth, async (req, res) => {
+  try {
+    const { newEmail, code } = req.body;
+    const userId = req.user.id;
+    const user = await User.findById(userId);
+    if (user.pendingEmail !== newEmail) return res.status(400).json({ success: false, message: 'Email mismatch' });
+    if (user.pendingEmailCode !== code) return res.status(400).json({ success: false, message: 'Invalid verification code' });
+    if (Date.now() > user.pendingEmailCodeExpires) return res.status(400).json({ success: false, message: 'Code expired' });
+
+    user.email = newEmail;
+    user.pendingEmail = null;
+    user.pendingEmailCode = null;
+    user.pendingEmailCodeExpires = null;
+    user.isVerified = true;
+    await user.save();
+    res.json({ success: true, message: 'Email updated successfully!' });
+  } catch (error) {
+    console.error('Verify email change error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.put('/api/user/change-password', auth, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+    const userId = req.user.id;
+    const user = await User.findById(userId);
+    const isValid = await bcrypt.compare(oldPassword, user.password);
+    if (!isValid) return res.status(400).json({ success: false, message: 'Current password is incorrect' });
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+    res.json({ success: true, message: 'Password updated successfully!' });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.put('/api/user/business-name', auth, async (req, res) => {
+  try {
+    const { businessName } = req.body;
+    const userId = req.user.id;
+    const user = await User.findById(userId);
+    user.businessName = businessName;
+    await user.save();
+    res.json({
+      success: true,
+      message: 'Business name updated successfully!',
+      user: getUserResponse(user)
+    });
+  } catch (error) {
+    console.error('Change business name error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.put('/api/user/upgrade', auth, async (req, res) => {
+  try {
+    const { plan } = req.body;
+    const userId = req.user.id;
+    const user = await User.findById(userId);
+    user.plan = plan;
+    await user.save();
+    res.json({
+      success: true,
+      message: `Plan upgraded to ${plan}!`,
+      user: getUserResponse(user)
+    });
+  } catch (error) {
+    console.error('Upgrade error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- BUSINESS ROUTES ----------
+app.get('/api/businesses', auth, async (req, res) => {
+  try {
+    const businesses = await Business.find({ userId: req.user._id }).sort({ createdAt: -1 });
+    res.json({ success: true, data: businesses });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/api/businesses', auth, async (req, res) => {
+  try {
+    const { name, platform, externalId, accessToken } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Business name is required' });
+
+    const plan = req.user.plan || 'single';
+    const count = await Business.countDocuments({ userId: req.user._id });
+    const limit = plan === 'pro' ? 5 : plan === 'business' ? Infinity : 1;
+    if (count >= limit) {
+      return res.status(403).json({ success: false, message: `Plan limit reached (max ${limit === Infinity ? 'unlimited' : limit} businesses)` });
+    }
+
+    const business = new Business({
+      userId: req.user._id,
+      name,
+      platform: platform || 'other',
+      externalId: externalId || '',
+      accessToken: accessToken || '',
+    });
+    await business.save();
+    res.json({ success: true, business });
+  } catch (error) {
+    console.error('Add business error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.delete('/api/businesses/:id', auth, async (req, res) => {
+  try {
+    const business = await Business.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!business) return res.status(404).json({ success: false, message: 'Business not found' });
+    await business.deleteOne();
+    res.json({ success: true, message: 'Business deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- SYNC ROUTE ----------
+app.post('/api/businesses/:id/sync', auth, async (req, res) => {
+  try {
+    const business = await Business.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!business) return res.status(404).json({ success: false, message: 'Business not found' });
+
+    const externalReviews = await fetchExternalReviews(business);
+    let newReviewsCount = 0;
+
+    for (const extReview of externalReviews) {
+      const existing = await Review.findOne({ externalReviewId: extReview.externalReviewId });
+      if (existing) continue;
+
+      const detectedLanguage = detectLanguage(extReview.content);
+
+      const review = new Review({
+        userId: req.user._id,
+        businessId: business._id,
+        reviewerName: extReview.reviewerName,
+        reviewerEmail: extReview.reviewerEmail || '',
+        rating: extReview.rating || 0,
+        content: extReview.content || '',
+        platform: extReview.platform || business.platform,
+        contentLanguage: detectedLanguage,
+        externalReviewId: extReview.externalReviewId,
+        status: 'pending'
+      });
+
+      const fraudResult = detectFakeReviewer(review);
+      review.fraudScore = fraudResult.score;
+      review.isFake = fraudResult.isFake;
+
+      await review.save();
+      newReviewsCount++;
+
+      const aiReply = await generateAIReply(review.content, review.rating, detectedLanguage);
+      const reply = new Reply({
+        reviewId: review._id,
+        userId: req.user._id,
+        draft: aiReply.content,
+        language: detectedLanguage,
+        status: 'draft'
+      });
+      await reply.save();
+
+      review.status = 'waiting_approval';
+      await review.save();
+
+      req.user.repliesUsed += 1;
+      await req.user.save();
+    }
+
+    business.lastSyncedAt = new Date();
+    await business.save();
+
+    res.json({
+      success: true,
+      message: `Sync completed. ${newReviewsCount} new reviews found and processed.`,
+      data: { newReviews: newReviewsCount }
+    });
+  } catch (error) {
+    console.error('Sync error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- REVIEW ROUTES ----------
+app.post('/api/reviews', auth, checkAccess, async (req, res) => {
+  try {
+    const { reviewerName, reviewerEmail, rating, content, platform, businessId } = req.body;
+    if (!businessId) {
+      return res.status(400).json({ success: false, message: 'businessId is required' });
+    }
+    const business = await Business.findOne({ _id: businessId, userId: req.user._id });
+    if (!business) {
+      return res.status(404).json({ success: false, message: 'Business not found or unauthorized' });
+    }
+
+    const detectedLanguage = detectLanguage(content);
+    const review = new Review({
+      userId: req.user._id,
+      businessId: business._id,
+      reviewerName,
+      reviewerEmail,
+      rating,
+      content,
+      platform: platform || 'other',
+      contentLanguage: detectedLanguage
+    });
+    const fraudResult = detectFakeReviewer(review);
+    review.fraudScore = fraudResult.score;
+    review.isFake = fraudResult.isFake;
+    await review.save();
+
+    const aiReply = await generateAIReply(content, rating, detectedLanguage);
+    const reply = new Reply({
+      reviewId: review._id,
+      userId: req.user._id,
+      draft: aiReply.content,
+      language: detectedLanguage,
+      status: 'draft'
+    });
+    await reply.save();
+
+    review.status = 'waiting_approval';
+    await review.save();
+    req.user.repliesUsed += 1;
+    await req.user.save();
+
+    res.status(201).json({
+      success: true,
+      data: {
+        reviewId: review._id,
+        replyId: reply._id,
+        detectedLanguage,
+        replyLanguage: aiReply.language,
+        draft: reply.draft,
+        isFake: review.isFake,
+        fraudScore: review.fraudScore,
+        fraudReasons: fraudResult.reasons,
+        status: review.status
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/api/reviews/pending', auth, async (req, res) => {
+  try {
+    const reviews = await Review.find({ userId: req.user._id, status: 'waiting_approval' })
+      .populate('businessId', 'name')
+      .sort({ createdAt: -1 });
+      
+    const reviewsWithReplies = await Promise.all(reviews.map(async (review) => {
+      const reply = await Reply.findOne({ reviewId: review._id });
+      return {
+        ...review.toObject(),
+        business: review.businessId,
+        reply: reply ? { 
+          id: reply._id, 
+          draft: reply.draft, 
+          language: reply.language, 
+          status: reply.status 
+        } : null
+      };
+    }));
+    res.json({ success: true, data: reviewsWithReplies });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/api/reviews/history', auth, async (req, res) => {
+  try {
+    const reviews = await Review.find({ userId: req.user._id })
+      .populate('businessId', 'name')
+      .sort({ createdAt: -1 }).limit(50);
+    const reviewsWithReplies = await Promise.all(reviews.map(async (review) => {
+      const reply = await Reply.findOne({ reviewId: review._id });
+      return {
+        ...review.toObject(),
+        business: review.businessId,
+        reply: reply ? { 
+          id: reply._id, 
+          final: reply.final || reply.draft, 
+          language: reply.language, 
+          status: reply.status, 
+          sentAt: reply.sentAt 
+        } : null
+      };
+    }));
+    res.json({ success: true, data: reviewsWithReplies });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/api/reviews/:id', auth, async (req, res) => {
+  try {
+    const review = await Review.findOne({ _id: req.params.id, userId: req.user._id }).populate('businessId', 'name');
+    if (!review) return res.status(404).json({ success: false, message: 'Review not found' });
+    const reply = await Reply.findOne({ reviewId: review._id });
+    res.json({ success: true, data: { review, reply } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- REPLY ROUTES ----------
+app.post('/api/replies/:id/approve', auth, async (req, res) => {
+  try {
+    const reply = await Reply.findById(req.params.id);
+    if (!reply) return res.status(404).json({ success: false, message: 'Reply not found' });
+    if (reply.userId.toString() !== req.user._id.toString()) return res.status(403).json({ success: false, message: 'Unauthorized' });
+    reply.final = req.body.final || reply.draft;
+    reply.status = 'approved';
+    reply.approvedAt = new Date();
+    await reply.save();
+    await Review.findByIdAndUpdate(reply.reviewId, { status: 'sent' });
+    reply.status = 'sent';
+    reply.sentAt = new Date();
+    await reply.save();
+    res.json({ success: true, message: 'Reply approved and sent!', data: reply });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.put('/api/replies/:id/edit', auth, async (req, res) => {
+  try {
+    const { content } = req.body;
+    const reply = await Reply.findById(req.params.id);
+    if (!reply) return res.status(404).json({ success: false, message: 'Reply not found' });
+    if (reply.userId.toString() !== req.user._id.toString()) return res.status(403).json({ success: false, message: 'Unauthorized' });
+    if (!reply.editHistory) reply.editHistory = [];
+    reply.editHistory.push(reply.draft);
+    reply.draft = content;
+    reply.status = 'edited';
+    await reply.save();
+    res.json({ success: true, message: 'Reply updated', data: reply });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/api/replies/:id/regenerate', auth, async (req, res) => {
+  try {
+    const reply = await Reply.findById(req.params.id);
+    if (!reply) return res.status(404).json({ success: false, message: 'Reply not found' });
+    const review = await Review.findById(reply.reviewId);
+    if (!review) return res.status(404).json({ success: false, message: 'Review not found' });
+    const targetLanguage = req.body.language || review.contentLanguage || 'en-US';
+    const newReply = await generateAIReply(review.content, review.rating, targetLanguage);
+    reply.draft = newReply.content;
+    reply.language = targetLanguage;
+    reply.status = 'draft';
+    await reply.save();
+    res.json({ success: true, message: 'New reply generated', data: { draft: reply.draft, language: reply.language } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/api/replies/:id/reject', auth, async (req, res) => {
+  try {
+    const reply = await Reply.findById(req.params.id);
+    if (!reply) return res.status(404).json({ success: false, message: 'Reply not found' });
+    if (reply.userId.toString() !== req.user._id.toString()) return res.status(403).json({ success: false, message: 'Unauthorized' });
+    reply.status = 'rejected';
+    await reply.save();
+    await Review.findByIdAndUpdate(reply.reviewId, { status: 'rejected' });
+    res.json({ success: true, message: 'Reply rejected', data: reply });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- DASHBOARD ----------
+app.get('/api/dashboard/stats', auth, async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const totalReviews = await Review.countDocuments({ userId });
+    const pendingReviews = await Review.countDocuments({ userId, status: 'waiting_approval' });
+    const sentReviews = await Review.countDocuments({ userId, status: 'sent' });
+    const fakeReviews = await Review.countDocuments({ userId, isFake: true });
+    const repliesUsed = req.user.repliesUsed;
+    const limit = req.user.monthlyLimit;
+    const firstDayOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const reviewsThisMonth = await Review.countDocuments({ userId, createdAt: { $gte: firstDayOfMonth } });
+    res.json({
+      success: true,
+      data: {
+        totalReviews,
+        pendingReviews,
+        sentReviews,
+        fakeReviews,
+        repliesUsed,
+        monthlyLimit: limit,
+        remainingReplies: Math.max(0, limit - repliesUsed),
+        reviewsThisMonth,
+        trialDaysLeft: Math.max(0, Math.ceil((req.user.trialEnds - new Date()) / (1000 * 60 * 60 * 24))),
+        isTrialActive: req.user.trialEnds > new Date(),
+        isSubscribed: req.user.isSubscribed,
+        subscriptionPlan: req.user.subscriptionPlan,
+        preferredLanguage: req.user.preferredLanguage,
+        supportedLanguages: SUPPORTED_LANGUAGES
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/api/languages', (req, res) => {
+  res.json({ success: true, data: SUPPORTED_LANGUAGES });
+});
+
+// ---------- PLANS ----------
+app.get('/api/plans', async (req, res) => {
+  try {
+    const plans = [
+      { id: 'single', name: 'Single Business', price: 0, currency: 'USD', features: ['1 business', '50 replies/month', 'All 11 languages', 'AI fraud detection'] },
+      { id: 'pro', name: 'Pro', price: 9.99, currency: 'USD', features: ['5 businesses', 'Unlimited replies', 'All 11 languages', 'Priority support', 'Advanced analytics'] },
+      { id: 'business', name: 'Business', price: 19.99, currency: 'USD', features: ['Unlimited businesses', 'Unlimited replies', 'All 11 languages', 'Priority support', 'Advanced analytics', 'Custom branding'] }
+    ];
+    res.json({ success: true, data: plans });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- SUBSCRIPTION ----------
+app.post('/api/user/subscribe', auth, async (req, res) => {
+  try {
+    const { planId } = req.body;
+    const user = req.user;
+    const validPlans = ['single', 'pro', 'business'];
+    if (!validPlans.includes(planId)) {
+      return res.status(400).json({ success: false, message: 'Invalid plan' });
+    }
+
+    user.plan = planId;
+    user.isSubscribed = true;
+    user.subscriptionPlan = planId;
+    user.subscriptionStart = new Date();
+    const subscriptionDuration = 30;
+    user.subscriptionEnds = new Date(Date.now() + subscriptionDuration * 24 * 60 * 60 * 1000);
+    user.trialEnds = null;
+
+    await user.save();
+
+    res.json({
+      success: true,
+      message: `Subscribed to ${planId} plan successfully`,
+      user: getUserResponse(user)
+    });
+  } catch (error) {
+    console.error('Subscribe error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/api/user/unsubscribe', auth, async (req, res) => {
+  try {
+    const user = req.user;
+    user.isSubscribed = false;
+    user.subscriptionPlan = null;
+    user.subscriptionStart = null;
+    user.subscriptionEnds = null;
+    user.plan = 'single';
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Unsubscribed successfully',
+      user: getUserResponse(user)
+    });
+  } catch (error) {
+    console.error('Unsubscribe error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/api/user/subscription/status', auth, async (req, res) => {
+  try {
+    const user = req.user;
+    const isTrialValid = user.trialEnds > new Date();
+    const daysLeft = Math.max(0, Math.ceil((user.trialEnds - new Date()) / (1000 * 60 * 60 * 24)));
+    res.json({
+      success: true,
+      data: {
+        isSubscribed: user.isSubscribed,
+        subscriptionPlan: user.subscriptionPlan,
+        subscriptionStart: user.subscriptionStart,
+        trialActive: isTrialValid,
+        trialDaysLeft: daysLeft,
+        trialEnds: user.trialEnds,
+        repliesUsed: user.repliesUsed,
+        monthlyLimit: user.monthlyLimit
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- WEBHOOK ----------
+app.post('/api/webhook/review', async (req, res) => {
+  try {
+    const { platform, data } = req.body;
+    const user = await User.findOne({ businessEmail: data.businessEmail });
+    if (!user) return res.status(404).json({ success: false, message: 'Business not found' });
+    
+    const detectedLanguage = detectLanguage(data.content);
+    const review = new Review({
+      userId: user._id,
+      businessId: data.businessId,
+      reviewerName: data.reviewerName,
+      reviewerEmail: data.reviewerEmail,
+      rating: data.rating,
+      content: data.content,
+      platform,
+      contentLanguage: detectedLanguage
+    });
+    const fraudResult = detectFakeReviewer(review);
+    review.fraudScore = fraudResult.score;
+    review.isFake = fraudResult.isFake;
+    await review.save();
+    
+    const aiReply = await generateAIReply(data.content, data.rating, detectedLanguage);
+    const reply = new Reply({
+      reviewId: review._id,
+      userId: user._id,
+      draft: aiReply.content,
+      language: detectedLanguage,
+      status: 'draft'
+    });
+    await reply.save();
+    review.status = 'waiting_approval';
+    await review.save();
+    res.json({ success: true, message: 'Review received and processed', data: { reviewId: review._id, replyId: reply._id, detectedLanguage, replyLanguage: aiReply.language } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ============ START SERVER ============
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+╔══════════════════════════════════════════════════════════════╗
+║   🌍 AstarsD SYSTEM                                ║
+║   🤖 AI AUTO-REPLIES IN 11 LANGUAGES                      ║
+║   🌐 Live at: https://api.astarsd.app                     ║
+║   ✉️  Emails from: ${process.env.EMAIL_USER || 'support@astarsd.app'}   ║
+║   📅 Status: RUNNING                                       ║
+║   💳 Subscription System: ENABLED                          ║
+║   🏢 Multi-Business: ENABLED                              ║
+║   🔄 Auto-Sync: ENABLED                                    ║
+╚══════════════════════════════════════════════════════════════╝
+  `);
+});
