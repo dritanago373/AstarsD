@@ -6,7 +6,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const OpenAI = require('openai');
-
+const auth = require('./middleware/auth');
 const app = express();
 app.use(express.json());
 app.use(cors()); 
@@ -125,8 +125,6 @@ const UserSchema = new mongoose.Schema({
   subscriptionPlan: { type: String, enum: ['single', 'pro', 'business', null], default: null },
   subscriptionStart: { type: Date, default: null },
   subscriptionEnds: { type: Date, default: null },
-  repliesUsed: { type: Number, default: 0 },
-  monthlyLimit: { type: Number, default: 50 },
   createdAt: { type: Date, default: Date.now },
   isVerified: { type: Boolean, default: false },
   verificationCode: { type: String },
@@ -181,34 +179,29 @@ const ReplySchema = new mongoose.Schema({
 const Reply = mongoose.model('Reply', ReplySchema);
 
 // ============ MIDDLEWARE ============
-const auth = async (req, res, next) => {
-  try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
-    if (!token) throw new Error();
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
-    const user = await User.findById(decoded.id);
-    if (!user) throw new Error();
-    req.user = user;
-    next();
-  } catch (error) {
-    res.status(401).json({ success: false, message: 'Please authenticate' });
-  }
-};
 
 const checkAccess = async (req, res, next) => {
   const user = req.user;
+
+  // ✅ Subscribed users have permanent access (unlimited)
+  if (user.isSubscribed) {
+    return next();
+  }
+
+  // ✅ Free users: Check if trial is still active (14 days)
   const isTrialValid = user.trialEnds > new Date();
-  const hasSubscription = user.isSubscribed;
-  const underLimit = user.repliesUsed < user.monthlyLimit;
-  if (!isTrialValid && !hasSubscription && !underLimit) {
+  if (!isTrialValid) {
     return res.status(403).json({
       success: false,
-      message: 'Free trial expired. Please subscribe to continue.',
+      message: 'Your 14-day free trial has ended. Please subscribe to continue using AstarsD.',
       trialEnded: true
     });
   }
+
+  // ✅ Trial is active – allow unlimited access
   next();
 };
+
 
 // ============ HELPER: Consistent user response ============
 const getUserResponse = (user) => {
@@ -451,22 +444,22 @@ app.post('/api/auth/register', async (req, res) => {
       phone,
       preferredLanguage: preferredLanguage || 'en-US',
       plan: plan || 'single',
-      isVerified: true,
+      isVerified: false,
       verificationCode,
       verificationCodeExpires: Date.now() + 300000,
       trialEnds: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
     });
     await user.save();
-    await sendVerificationEmail(email, verificationCode, businessName);
-
-    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+    sendVerificationEmail(email, verificationCode, businessName)
+    
+      .catch(err => console.error('Email sending failed:', err));
 
     res.status(201).json({
       success: true,
-      message: 'Account created! 14-day free trial started.',
-      token,
-      user: getUserResponse(user)
+      message: 'Account created! A verification code has been sent to your email. Please verify your email to activate your account.',
+      email: user.email
     });
+   
   } catch (error) {
     console.error('Registration error:', error);
     res.status(500).json({ success: false, message: error.message });
@@ -745,9 +738,6 @@ app.post('/api/businesses/:id/sync', auth, async (req, res) => {
 
       review.status = 'waiting_approval';
       await review.save();
-
-      req.user.repliesUsed += 1;
-      await req.user.save();
     }
 
     business.lastSyncedAt = new Date();
