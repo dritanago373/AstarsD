@@ -18,10 +18,11 @@ const auth = async (req, res, next) => {
 
     console.log("👉 3. Token extracted. Verifying...");
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    console.log("👉 4. Token valid. Decoded ID:", decoded.id);
+    console.log("👉 4. Token valid. Decoded Email:", decoded.email);
     
-    console.log("👉 5. Searching for user in DB...");
-    const user = await User.findById(decoded.id).select('-password');
+    console.log("👉 5. Searching for user in DB by email...");
+    // 👇 THIS IS THE LINE WE CHANGED 👇
+    const user = await User.findOne({ email: decoded.email }).select('-password');
     
     if (!user) {
       console.log("❌ 6. User NOT found in database. Returning 401.");
