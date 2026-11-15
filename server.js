@@ -7,6 +7,7 @@ const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const OpenAI = require('openai');
 const auth = require('./middleware/auth');
+const User = require('./models/User');
 const app = express();
 app.use(express.json());
 app.use(cors()); 
@@ -114,27 +115,7 @@ async function sendVerificationEmail(to, code, businessName) {
 }
 
 // ============ MODELS ============
-const UserSchema = new mongoose.Schema({
-  email: { type: String, unique: true, required: true },
-  password: { type: String, required: true },
-  businessName: String,
-  phone: String,
-  preferredLanguage: { type: String, default: 'en-US', enum: Object.keys(SUPPORTED_LANGUAGES) },
-  trialEnds: { type: Date, default: () => new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) },
-  isSubscribed: { type: Boolean, default: false },
-  subscriptionPlan: { type: String, enum: ['single', 'pro', 'business', null], default: null },
-  subscriptionStart: { type: Date, default: null },
-  subscriptionEnds: { type: Date, default: null },
-  createdAt: { type: Date, default: Date.now },
-  isVerified: { type: Boolean, default: false },
-  verificationCode: { type: String },
-  verificationCodeExpires: { type: Date },
-  pendingEmail: { type: String },
-  pendingEmailCode: { type: String },
-  pendingEmailCodeExpires: { type: Date },
-  plan: { type: String, default: 'single' },
-});
-const User = mongoose.model('User', UserSchema);
+
 
 const BusinessSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
