@@ -1,4 +1,6 @@
-// models/User.js
+//models/User.js
+const mongoose = require('mongoose');
+
 const UserSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
@@ -16,4 +18,11 @@ const UserSchema = new mongoose.Schema({
   trialEnds: { type: Date },
   repliesUsed: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
+  // Adding these back so it matches what server.js expects
+  preferredLanguage: { type: String, default: 'en-US' },
+  subscriptionPlan: { type: String, enum: ['single', 'pro', 'business', null], default: null },
+  subscriptionStart: { type: Date, default: null },
+  subscriptionEnds: { type: Date, default: null },
 });
+
+module.exports = mongoose.model('User', UserSchema); // 👈 THIS LINE IS CRITICAL
