@@ -28,6 +28,8 @@ app.use(cors({
     'https://astarsd.app',
     'https://www.astarsd.app',
     'https://api.astarsd.app',
+    'https://app.astarsd.app',
+    'https://astarsdapp.vercel.app',
     'http://localhost:3000',   // React dev
     'http://localhost:8081',   // React Native / Expo local
     'http://localhost:19006'   // Expo web local
