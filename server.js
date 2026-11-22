@@ -358,7 +358,23 @@ async function fetchExternalReviews(business) {
       const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&key=${apiKey}&fields=name,rating,reviews,user_ratings_total`;
       const response = await fetch(url);
       const data = await response.json();
-      if (data.status !== 'OK') { console.error('❌ Google API Error:', data.status); return []; }
+      if (data.status !== 'OK') {
+        console.error('❌ Google API Error (legacy):', data.status, data.error_message || '');
+        // Fallback: Places API (New) for projects where the legacy API is not available
+        const r2 = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+          headers: { 'X-Goog-Api-Key': apiKey, 'X-Goog-FieldMask': 'reviews' },
+        });
+        const d2 = await r2.json();
+        if (!r2.ok) { console.error('❌ Google Places (New) error:', r2.status, d2?.error?.message || ''); return []; }
+        return (d2.reviews || []).map((rv) => ({
+          externalReviewId: `google_${placeId}_${rv.name || rv.publishTime}`,
+          reviewerName: rv.authorAttribution?.displayName || 'Anonymous',
+          reviewerEmail: '',
+          rating: rv.rating || 0,
+          content: rv.text?.text || rv.originalText?.text || '',
+          platform: 'google',
+        }));
+      }
       if (!data.result?.reviews || data.result.reviews.length === 0) { console.log(`ℹ️ No reviews on Google`); return []; }
       console.log(`✅ Found ${data.result.reviews.length} reviews on Google`);
       return data.result.reviews.map((review) => ({
@@ -740,24 +756,48 @@ app.get('/api/places/search', auth, placeSearchLimiter, async (req, res) => {
       return res.status(503).json({ success: false, message: 'Business search is not configured.' });
     }
 
+    // 1) Legacy Places API (works for older Google Cloud projects)
     const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(q)}&key=${apiKey}`;
     const response = await fetch(url);
     const data = await response.json();
 
     if (data.status === 'ZERO_RESULTS') return res.json({ success: true, data: [] });
-    if (data.status !== 'OK') {
-      console.error('Places search error:', data.status, data.error_message || '');
+    if (data.status === 'OK') {
+      const results = (data.results || []).slice(0, 6).map((p) => ({
+        id: p.place_id,
+        name: p.name,
+        address: p.formatted_address || '',
+        rating: p.rating || null,
+        reviewCount: p.user_ratings_total || 0,
+      }));
+      return res.json({ success: true, data: results });
+    }
+    console.error('Places (legacy) search error:', data.status, data.error_message || '');
+
+    // 2) Places API (New): new Google Cloud projects can only use this one
+    const r2 = await fetch('https://places.googleapis.com/v1/places:searchText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask':
+          'places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount',
+      },
+      body: JSON.stringify({ textQuery: q, pageSize: 6 }),
+    });
+    const d2 = await r2.json();
+    if (!r2.ok) {
+      console.error('Places (New) search error:', r2.status, d2?.error?.status, d2?.error?.message || '');
       return res.status(502).json({ success: false, message: 'Business search is unavailable right now.' });
     }
-
-    const results = (data.results || []).slice(0, 6).map((p) => ({
-      id: p.place_id,
-      name: p.name,
-      address: p.formatted_address || '',
+    const results2 = (d2.places || []).slice(0, 6).map((p) => ({
+      id: p.id,
+      name: p.displayName?.text || '',
+      address: p.formattedAddress || '',
       rating: p.rating || null,
-      reviewCount: p.user_ratings_total || 0,
+      reviewCount: p.userRatingCount || 0,
     }));
-    res.json({ success: true, data: results });
+    res.json({ success: true, data: results2 });
   } catch (error) {
     console.error('Place search error:', error.message);
     res.status(500).json({ success: false, message: 'Business search failed.' });
