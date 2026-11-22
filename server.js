@@ -9,6 +9,7 @@ const OpenAI = require('openai');
 const auth = require('./middleware/auth');
 const paymentsRouter = require('./routes/payments');
 const subscriptionRouter = require('./routes/subscription');
+const googleRouter = require('./routes/google');
 const { hasActiveSubscription, safeEqual } = require('./services/billing');
 const User = require('./models/User');
 const app = express();
@@ -132,6 +133,9 @@ const BusinessSchema = new mongoose.Schema({
   platform: { type: String, enum: ['google', 'facebook', 'yelp', 'other'], default: 'other' },
   externalId: { type: String },
   accessToken: { type: String },
+  googleAccount: { type: String },   // e.g. accounts/123 (set by "Connect with Google")
+  googleLocation: { type: String },  // e.g. locations/456
+  googleVerified: { type: Boolean, default: false },
   lastSyncedAt: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now }
 });
@@ -150,6 +154,7 @@ const ReviewSchema = new mongoose.Schema({
   fraudScore: { type: Number, default: 0 },
   status: { type: String, enum: ['pending', 'ai_draft', 'waiting_approval', 'sent', 'rejected'], default: 'pending' },
   externalReviewId: { type: String, unique: true, sparse: true },
+  googleReviewName: { type: String }, // accounts/X/locations/Y/reviews/Z (needed to post a reply)
   createdAt: { type: Date, default: Date.now }
 });
 const Review = mongoose.model('Review', ReviewSchema);
@@ -331,7 +336,19 @@ function detectFakeReviewer(review) {
 async function fetchExternalReviews(business) {
   console.log(`🔍 Fetching reviews for ${business.name} (${business.platform})`);
 
-  // GOOGLE
+  // GOOGLE (owner-connected: official Business Profile API, replies can be posted)
+  if (business.platform === 'google' && business.googleVerified && business.googleLocation) {
+    try {
+      const reviews = await googleRouter.fetchLinkedReviews(business);
+      console.log(`✅ Found ${reviews.length} unanswered reviews via Business Profile API`);
+      return reviews;
+    } catch (error) {
+      console.error('❌ Business Profile API error:', error.message);
+      return [];
+    }
+  }
+
+  // GOOGLE (public Places API: read-only)
   if (business.platform === 'google') {
     try {
       const apiKey = process.env.GOOGLE_API_KEY;
@@ -697,6 +714,56 @@ app.delete('/api/businesses/:id', auth, async (req, res) => {
   }
 });
 
+// ---------- PLACE SEARCH (lets clients find their business by name instead of a Place ID) ----------
+// Small per-user limiter so nobody can burn your Google API quota: 30 searches per minute.
+const placeSearchHits = new Map();
+const placeSearchLimiter = (req, res, next) => {
+  const key = String(req.user._id);
+  const now = Date.now();
+  const recent = (placeSearchHits.get(key) || []).filter((t) => now - t < 60000);
+  if (recent.length >= 30) {
+    return res.status(429).json({ success: false, message: 'Too many searches. Please wait a minute.' });
+  }
+  recent.push(now);
+  placeSearchHits.set(key, recent);
+  next();
+};
+
+// GET /api/places/search?q=coffee shop rome  ->  [{ id, name, address, rating, reviewCount }]
+app.get('/api/places/search', auth, placeSearchLimiter, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim().slice(0, 120);
+    if (q.length < 3) return res.json({ success: true, data: [] });
+
+    const apiKey = process.env.GOOGLE_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ success: false, message: 'Business search is not configured.' });
+    }
+
+    const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(q)}&key=${apiKey}`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.status === 'ZERO_RESULTS') return res.json({ success: true, data: [] });
+    if (data.status !== 'OK') {
+      console.error('Places search error:', data.status, data.error_message || '');
+      return res.status(502).json({ success: false, message: 'Business search is unavailable right now.' });
+    }
+
+    const results = (data.results || []).slice(0, 6).map((p) => ({
+      id: p.place_id,
+      name: p.name,
+      address: p.formatted_address || '',
+      rating: p.rating || null,
+      reviewCount: p.user_ratings_total || 0,
+    }));
+    res.json({ success: true, data: results });
+  } catch (error) {
+    console.error('Place search error:', error.message);
+    res.status(500).json({ success: false, message: 'Business search failed.' });
+  }
+});
+
 // ---------- SYNC ROUTE (now requires trial or subscription: it calls OpenAI) ----------
 app.post('/api/businesses/:id/sync', auth, checkAccess, async (req, res) => {
   try {
@@ -722,6 +789,7 @@ app.post('/api/businesses/:id/sync', auth, checkAccess, async (req, res) => {
         platform: extReview.platform || business.platform,
         contentLanguage: detectedLanguage,
         externalReviewId: extReview.externalReviewId,
+        googleReviewName: extReview.googleReviewName,
         status: 'pending'
       });
 
@@ -893,11 +961,34 @@ app.post('/api/replies/:id/approve', auth, async (req, res) => {
     reply.status = 'approved';
     reply.approvedAt = new Date();
     await reply.save();
+
+    // Post directly to Google when the business is connected through "Connect with Google".
+    const review = await Review.findById(reply.reviewId);
+    let postedToPlatform = false;
+    if (review && review.googleReviewName) {
+      try {
+        await googleRouter.postReviewReply(req.user._id, review.googleReviewName, reply.final);
+        postedToPlatform = true;
+      } catch (postErr) {
+        console.error('Post to Google failed:', postErr.message);
+        const msg =
+          postErr.code === 'NOT_CONNECTED'
+            ? postErr.message
+            : 'Reply saved, but Google did not accept it yet. Check your Google connection and try again.';
+        return res.status(502).json({ success: false, message: msg, data: reply });
+      }
+    }
+
     await Review.findByIdAndUpdate(reply.reviewId, { status: 'sent' });
     reply.status = 'sent';
     reply.sentAt = new Date();
     await reply.save();
-    res.json({ success: true, message: 'Reply approved and sent!', data: reply });
+    res.json({
+      success: true,
+      message: postedToPlatform ? 'Reply posted on Google!' : 'Reply approved and sent!',
+      data: reply,
+      postedToPlatform,
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1060,6 +1151,9 @@ app.post('/api/webhook/review', async (req, res) => {
 
 // ---------- PAYMENT WEBHOOKS: /api/webhooks/paddle and /api/webhooks/revenuecat ----------
 app.use('/api/webhooks', paymentsRouter);
+
+// ---------- GOOGLE CONNECT (OAuth, link locations, post replies) ----------
+app.use('/api/google', googleRouter);
 
 // ============ START SERVER ============
 const PORT = process.env.PORT || 5000;
