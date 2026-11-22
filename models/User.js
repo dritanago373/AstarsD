@@ -1,4 +1,4 @@
-//models/User.js
+// models/User.js
 const mongoose = require('mongoose');
 
 const UserSchema = new mongoose.Schema({
@@ -18,11 +18,22 @@ const UserSchema = new mongoose.Schema({
   trialEnds: { type: Date },
   repliesUsed: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
-  // Adding these back so it matches what server.js expects
   preferredLanguage: { type: String, default: 'en-US' },
   subscriptionPlan: { type: String, enum: ['single', 'pro', 'business', null], default: null },
   subscriptionStart: { type: Date, default: null },
   subscriptionEnds: { type: Date, default: null },
+
+  // ---- Used by server.js but were missing from the schema (Mongoose silently dropped them) ----
+  phone: { type: String },
+  businessEmail: { type: String },                 // used by /api/webhook/review
+  monthlyLimit: { type: Number, default: 50 },     // shown in the dashboard; adjust to your plan rules
+
+  // ---- NEW: billing fields (Paddle + Apple/Google via RevenueCat) ----
+  billingProvider: { type: String, enum: ['paddle', 'apple', 'google', null], default: null },
+  paddleCustomerId: { type: String, default: null, index: true },
+  paddleSubscriptionId: { type: String, default: null, index: true },
+  cancelAtPeriodEnd: { type: Boolean, default: false },
+  billingEventAt: { type: Date, default: null },   // lets webhooks ignore out-of-order events
 });
 
 module.exports = mongoose.model('User', UserSchema); // 👈 THIS LINE IS CRITICAL

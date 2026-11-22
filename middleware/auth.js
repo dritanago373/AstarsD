@@ -1,46 +1,35 @@
+// middleware/auth.js
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 
 const auth = async (req, res, next) => {
   try {
     const authHeader = req.header('Authorization');
-    console.log("👉 1. Auth Header received:", authHeader ? "YES" : "NO");
-    
     const token = authHeader?.replace('Bearer ', '');
-    
+
     if (!token) {
-      console.log("❌ 2. No token found. Returning 401.");
-      return res.status(401).json({
-        success: false,
-        message: 'No token, authorization denied'
-      });
+      return res.status(401).json({ success: false, message: 'No token, authorization denied' });
     }
 
-    console.log("👉 3. Token extracted. Verifying...");
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    console.log("👉 4. Token valid. Decoded Email:", decoded.email);
-    
-    console.log("👉 5. Searching for user in DB by email...");
-    // 👇 THIS IS THE LINE WE CHANGED 👇
-    const user = await User.findOne({ email: decoded.email }).select('-password');
-    
+    // Must match the secret used to sign tokens in server.js
+    const secret = process.env.JWT_SECRET || 'secret';
+    const decoded = jwt.verify(token, secret);
+
+    // Look up by id (not email) so tokens stay valid after an email change.
+    // Tokens issued before this change also contain the id, so nobody is logged out.
+    const user = await User.findById(decoded.id).select('-password');
+
     if (!user) {
-      console.log("❌ 6. User NOT found in database. Returning 401.");
-      return res.status(401).json({
-        success: false,
-        message: 'User not found'
-      });
+      return res.status(401).json({ success: false, message: 'User not found' });
     }
-    
-    console.log("✅ 7. User found! Proceeding to route...");
-    req.user = user;
+
+    req.user = user; // full Mongoose document (billing routes call user.save())
     next();
-    
   } catch (error) {
-    console.error("🚨 8. AUTH CRASHED:", error.message);
     if (error.name === 'TokenExpiredError') {
       return res.status(401).json({ success: false, message: 'Token expired' });
     }
+    if (process.env.NODE_ENV !== 'production') console.error('Auth error:', error.message);
     res.status(401).json({ success: false, message: 'Token is not valid' });
   }
 };

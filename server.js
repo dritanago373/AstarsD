@@ -7,20 +7,29 @@ const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const OpenAI = require('openai');
 const auth = require('./middleware/auth');
+const paymentsRouter = require('./routes/payments');
+const subscriptionRouter = require('./routes/subscription');
+const { hasActiveSubscription, safeEqual } = require('./services/billing');
 const User = require('./models/User');
 const app = express();
-app.use(express.json());
-app.use(cors()); 
+
+// Keep the raw body: Paddle webhook signatures are verified against it
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+
 app.get('/', (req, res) => {
   res.send('AstarsD Backend is live!');
 });
+
 // ============ CORS – allow your domains ============
+// (The extra open `app.use(cors())` was removed: it made the allow-list below pointless.)
 app.use(cors({
   origin: [
     'https://astarsd.app',
+    'https://www.astarsd.app',
     'https://api.astarsd.app',
     'http://localhost:3000',   // React dev
-    'http://localhost:8081'    // React Native local
+    'http://localhost:8081',   // React Native / Expo local
+    'http://localhost:19006'   // Expo web local
   ],
   credentials: true
 }));
@@ -31,8 +40,8 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/AstarsD')
   .catch(err => console.error('❌ MongoDB Error:', err));
 
 // ============ OPENAI ============
-const openai = new OpenAI({ 
-  apiKey: process.env.OPENAI_API_KEY 
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
 });
 
 // ============ ALL LANGUAGES ============
@@ -115,7 +124,7 @@ async function sendVerificationEmail(to, code, businessName) {
 }
 
 // ============ MODELS ============
-
+// NOTE: add the billing fields from models/User.additions.js to your User schema.
 
 const BusinessSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -164,13 +173,13 @@ const Reply = mongoose.model('Reply', ReplySchema);
 const checkAccess = async (req, res, next) => {
   const user = req.user;
 
-  // ✅ Subscribed users have permanent access (unlimited)
-  if (user.isSubscribed) {
+  // ✅ Paid access (Paddle, App Store or Google Play) — stays valid until the paid period ends
+  if (hasActiveSubscription(user)) {
     return next();
   }
 
   // ✅ Free users: Check if trial is still active (14 days)
-  const isTrialValid = user.trialEnds > new Date();
+  const isTrialValid = user.trialEnds && user.trialEnds > new Date();
   if (!isTrialValid) {
     return res.status(403).json({
       success: false,
@@ -183,11 +192,11 @@ const checkAccess = async (req, res, next) => {
   next();
 };
 
-
 // ============ HELPER: Consistent user response ============
 const getUserResponse = (user) => {
+  const active = hasActiveSubscription(user);
   let subscriptionDaysLeft = 0;
-  if (user.isSubscribed && user.subscriptionEnds) {
+  if (active && user.subscriptionEnds) {
     subscriptionDaysLeft = Math.max(0, Math.ceil((user.subscriptionEnds - new Date()) / (1000 * 60 * 60 * 24)));
   } else if (user.trialEnds) {
     subscriptionDaysLeft = Math.max(0, Math.ceil((user.trialEnds - new Date()) / (1000 * 60 * 60 * 24)));
@@ -199,7 +208,10 @@ const getUserResponse = (user) => {
     plan: user.plan,
     isVerified: user.isVerified,
     trialEnds: user.trialEnds,
-    isSubscribed: user.isSubscribed,
+    isSubscribed: active,
+    billingProvider: active ? user.billingProvider || null : null,
+    cancelAtPeriodEnd: active ? !!user.cancelAtPeriodEnd : false,
+    currentPeriodEnd: active ? user.subscriptionEnds || null : null,
     subscriptionDaysLeft,
     repliesUsed: user.repliesUsed,
     monthlyLimit: user.monthlyLimit,
@@ -318,7 +330,7 @@ function detectFakeReviewer(review) {
 // ============ EXTERNAL REVIEW FETCHER ============
 async function fetchExternalReviews(business) {
   console.log(`🔍 Fetching reviews for ${business.name} (${business.platform})`);
-  
+
   // GOOGLE
   if (business.platform === 'google') {
     try {
@@ -345,7 +357,7 @@ async function fetchExternalReviews(business) {
       return [];
     }
   }
-  
+
   // FACEBOOK
   if (business.platform === 'facebook') {
     try {
@@ -372,7 +384,7 @@ async function fetchExternalReviews(business) {
       return [];
     }
   }
-  
+
   // YELP
   if (business.platform === 'yelp') {
     try {
@@ -401,7 +413,7 @@ async function fetchExternalReviews(business) {
       return [];
     }
   }
-  
+
   console.log(`⚠️ Platform "${business.platform}" not yet integrated`);
   return [];
 }
@@ -411,20 +423,21 @@ async function fetchExternalReviews(business) {
 // ---------- AUTH ----------
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { email, password, businessName, phone, preferredLanguage, plan } = req.body;
+    const { email, password, businessName, phone, preferredLanguage } = req.body;
     const existingUser = await User.findOne({ email });
     if (existingUser) return res.status(400).json({ success: false, message: 'Email already registered' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
 
+    // SECURITY: the plan is NOT taken from the request. Paid plans are only set by payment webhooks.
     const user = new User({
       email,
       password: hashedPassword,
       businessName,
       phone,
       preferredLanguage: preferredLanguage || 'en-US',
-      plan: plan || 'single',
+      plan: 'single',
       isVerified: false,
       verificationCode,
       verificationCodeExpires: Date.now() + 300000,
@@ -432,7 +445,6 @@ app.post('/api/auth/register', async (req, res) => {
     });
     await user.save();
     sendVerificationEmail(email, verificationCode, businessName)
-    
       .catch(err => console.error('Email sending failed:', err));
 
     res.status(201).json({
@@ -440,7 +452,7 @@ app.post('/api/auth/register', async (req, res) => {
       message: 'Account created! A verification code has been sent to your email. Please verify your email to activate your account.',
       email: user.email
     });
-   
+
   } catch (error) {
     console.error('Registration error:', error);
     res.status(500).json({ success: false, message: error.message });
@@ -606,23 +618,9 @@ app.put('/api/user/business-name', auth, async (req, res) => {
   }
 });
 
-app.put('/api/user/upgrade', auth, async (req, res) => {
-  try {
-    const { plan } = req.body;
-    const userId = req.user.id;
-    const user = await User.findById(userId);
-    user.plan = plan;
-    await user.save();
-    res.json({
-      success: true,
-      message: `Plan upgraded to ${plan}!`,
-      user: getUserResponse(user)
-    });
-  } catch (error) {
-    console.error('Upgrade error:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
+// REMOVED (security): PUT /api/user/upgrade, POST /api/user/subscribe, POST /api/user/unsubscribe.
+// They let any logged-in user grant themselves a paid plan for free. Plans now change only through
+// payment webhooks (routes/payments.js) and /api/user/subscription/* (routes/subscription.js).
 
 // ---------- BUSINESS ROUTES ----------
 app.get('/api/businesses', auth, async (req, res) => {
@@ -661,6 +659,33 @@ app.post('/api/businesses', auth, async (req, res) => {
   }
 });
 
+// NEW: the app's "Edit business" calls PUT /api/businesses/:id, which did not exist
+app.put('/api/businesses/:id', auth, async (req, res) => {
+  try {
+    const { name, platform, externalId } = req.body;
+    const business = await Business.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!business) return res.status(404).json({ success: false, message: 'Business not found' });
+
+    if (name !== undefined) {
+      if (!String(name).trim()) return res.status(400).json({ success: false, message: 'Business name is required' });
+      business.name = String(name).trim();
+    }
+    if (platform !== undefined) {
+      if (!['google', 'facebook', 'yelp', 'other'].includes(platform)) {
+        return res.status(400).json({ success: false, message: 'Invalid platform' });
+      }
+      business.platform = platform;
+    }
+    if (externalId !== undefined) business.externalId = externalId;
+
+    await business.save();
+    res.json({ success: true, business });
+  } catch (error) {
+    console.error('Edit business error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.delete('/api/businesses/:id', auth, async (req, res) => {
   try {
     const business = await Business.findOne({ _id: req.params.id, userId: req.user._id });
@@ -672,8 +697,8 @@ app.delete('/api/businesses/:id', auth, async (req, res) => {
   }
 });
 
-// ---------- SYNC ROUTE ----------
-app.post('/api/businesses/:id/sync', auth, async (req, res) => {
+// ---------- SYNC ROUTE (now requires trial or subscription: it calls OpenAI) ----------
+app.post('/api/businesses/:id/sync', auth, checkAccess, async (req, res) => {
   try {
     const business = await Business.findOne({ _id: req.params.id, userId: req.user._id });
     if (!business) return res.status(404).json({ success: false, message: 'Business not found' });
@@ -802,17 +827,17 @@ app.get('/api/reviews/pending', auth, async (req, res) => {
     const reviews = await Review.find({ userId: req.user._id, status: 'waiting_approval' })
       .populate('businessId', 'name')
       .sort({ createdAt: -1 });
-      
+
     const reviewsWithReplies = await Promise.all(reviews.map(async (review) => {
       const reply = await Reply.findOne({ reviewId: review._id });
       return {
         ...review.toObject(),
         business: review.businessId,
-        reply: reply ? { 
-          id: reply._id, 
-          draft: reply.draft, 
-          language: reply.language, 
-          status: reply.status 
+        reply: reply ? {
+          id: reply._id,
+          draft: reply.draft,
+          language: reply.language,
+          status: reply.status
         } : null
       };
     }));
@@ -832,12 +857,12 @@ app.get('/api/reviews/history', auth, async (req, res) => {
       return {
         ...review.toObject(),
         business: review.businessId,
-        reply: reply ? { 
-          id: reply._id, 
-          final: reply.final || reply.draft, 
-          language: reply.language, 
-          status: reply.status, 
-          sentAt: reply.sentAt 
+        reply: reply ? {
+          id: reply._id,
+          final: reply.final || reply.draft,
+          language: reply.language,
+          status: reply.status,
+          sentAt: reply.sentAt
         } : null
       };
     }));
@@ -899,6 +924,7 @@ app.post('/api/replies/:id/regenerate', auth, async (req, res) => {
   try {
     const reply = await Reply.findById(req.params.id);
     if (!reply) return res.status(404).json({ success: false, message: 'Reply not found' });
+    if (reply.userId.toString() !== req.user._id.toString()) return res.status(403).json({ success: false, message: 'Unauthorized' });
     const review = await Review.findById(reply.reviewId);
     if (!review) return res.status(404).json({ success: false, message: 'Review not found' });
     const targetLanguage = req.body.language || review.contentLanguage || 'en-US';
@@ -939,6 +965,7 @@ app.get('/api/dashboard/stats', auth, async (req, res) => {
     const limit = req.user.monthlyLimit;
     const firstDayOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     const reviewsThisMonth = await Review.countDocuments({ userId, createdAt: { $gte: firstDayOfMonth } });
+    const trialEnds = req.user.trialEnds;
     res.json({
       success: true,
       data: {
@@ -950,9 +977,9 @@ app.get('/api/dashboard/stats', auth, async (req, res) => {
         monthlyLimit: limit,
         remainingReplies: Math.max(0, limit - repliesUsed),
         reviewsThisMonth,
-        trialDaysLeft: Math.max(0, Math.ceil((req.user.trialEnds - new Date()) / (1000 * 60 * 60 * 24))),
-        isTrialActive: req.user.trialEnds > new Date(),
-        isSubscribed: req.user.isSubscribed,
+        trialDaysLeft: trialEnds ? Math.max(0, Math.ceil((trialEnds - new Date()) / (1000 * 60 * 60 * 24))) : 0,
+        isTrialActive: !!trialEnds && trialEnds > new Date(),
+        isSubscribed: hasActiveSubscription(req.user),
         subscriptionPlan: req.user.subscriptionPlan,
         preferredLanguage: req.user.preferredLanguage,
         supportedLanguages: SUPPORTED_LANGUAGES
@@ -968,6 +995,7 @@ app.get('/api/languages', (req, res) => {
 });
 
 // ---------- PLANS ----------
+// NOTE: these prices/features differ from the app (15 / 30 / 50 USD). Align them if the app uses this endpoint.
 app.get('/api/plans', async (req, res) => {
   try {
     const plans = [
@@ -981,88 +1009,22 @@ app.get('/api/plans', async (req, res) => {
   }
 });
 
-// ---------- SUBSCRIPTION ----------
-app.post('/api/user/subscribe', auth, async (req, res) => {
-  try {
-    const { planId } = req.body;
-    const user = req.user;
-    const validPlans = ['single', 'pro', 'business'];
-    if (!validPlans.includes(planId)) {
-      return res.status(400).json({ success: false, message: 'Invalid plan' });
-    }
+// ---------- SUBSCRIPTION (status, checkout-url, change-plan, cancel) ----------
+app.use('/api/user/subscription', subscriptionRouter);
 
-    user.plan = planId;
-    user.isSubscribed = true;
-    user.subscriptionPlan = planId;
-    user.subscriptionStart = new Date();
-    const subscriptionDuration = 30;
-    user.subscriptionEnds = new Date(Date.now() + subscriptionDuration * 24 * 60 * 60 * 1000);
-    user.trialEnds = null;
-
-    await user.save();
-
-    res.json({
-      success: true,
-      message: `Subscribed to ${planId} plan successfully`,
-      user: getUserResponse(user)
-    });
-  } catch (error) {
-    console.error('Subscribe error:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/api/user/unsubscribe', auth, async (req, res) => {
-  try {
-    const user = req.user;
-    user.isSubscribed = false;
-    user.subscriptionPlan = null;
-    user.subscriptionStart = null;
-    user.subscriptionEnds = null;
-    user.plan = 'single';
-    await user.save();
-
-    res.json({
-      success: true,
-      message: 'Unsubscribed successfully',
-      user: getUserResponse(user)
-    });
-  } catch (error) {
-    console.error('Unsubscribe error:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/api/user/subscription/status', auth, async (req, res) => {
-  try {
-    const user = req.user;
-    const isTrialValid = user.trialEnds > new Date();
-    const daysLeft = Math.max(0, Math.ceil((user.trialEnds - new Date()) / (1000 * 60 * 60 * 24)));
-    res.json({
-      success: true,
-      data: {
-        isSubscribed: user.isSubscribed,
-        subscriptionPlan: user.subscriptionPlan,
-        subscriptionStart: user.subscriptionStart,
-        trialActive: isTrialValid,
-        trialDaysLeft: daysLeft,
-        trialEnds: user.trialEnds,
-        repliesUsed: user.repliesUsed,
-        monthlyLimit: user.monthlyLimit
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// ---------- WEBHOOK ----------
+// ---------- REVIEW WEBHOOK (now requires a shared secret) ----------
 app.post('/api/webhook/review', async (req, res) => {
   try {
+    const secret = process.env.REVIEW_WEBHOOK_SECRET;
+    const provided = req.get('x-webhook-secret') || '';
+    if (!secret || !safeEqual(provided, secret)) {
+      return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
+
     const { platform, data } = req.body;
     const user = await User.findOne({ businessEmail: data.businessEmail });
     if (!user) return res.status(404).json({ success: false, message: 'Business not found' });
-    
+
     const detectedLanguage = detectLanguage(data.content);
     const review = new Review({
       userId: user._id,
@@ -1078,7 +1040,7 @@ app.post('/api/webhook/review', async (req, res) => {
     review.fraudScore = fraudResult.score;
     review.isFake = fraudResult.isFake;
     await review.save();
-    
+
     const aiReply = await generateAIReply(data.content, data.rating, detectedLanguage);
     const reply = new Reply({
       reviewId: review._id,
@@ -1096,19 +1058,22 @@ app.post('/api/webhook/review', async (req, res) => {
   }
 });
 
+// ---------- PAYMENT WEBHOOKS: /api/webhooks/paddle and /api/webhooks/revenuecat ----------
+app.use('/api/webhooks', paymentsRouter);
+
 // ============ START SERVER ============
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║   🌍 AstarsD SYSTEM                                ║
-║   🤖 AI AUTO-REPLIES IN 11 LANGUAGES                      ║
-║   🌐 Live at: https://api.astarsd.app                     ║
+║   🌍 AstarsD SYSTEM                                          ║
+║   🤖 AI AUTO-REPLIES IN 11 LANGUAGES                         ║
+║   🌐 Live at: https://api.astarsd.app                        ║
 ║   ✉️  Emails from: ${process.env.EMAIL_USER || 'support@astarsd.app'}   ║
-║   📅 Status: RUNNING                                       ║
-║   💳 Subscription System: ENABLED                          ║
-║   🏢 Multi-Business: ENABLED                              ║
-║   🔄 Auto-Sync: ENABLED                                    ║
+║   📅 Status: RUNNING                                         ║
+║   💳 Subscriptions: Paddle + App Store + Google Play         ║
+║   🏢 Multi-Business: ENABLED                                 ║
+║   🔄 Auto-Sync: ENABLED                                      ║
 ╚══════════════════════════════════════════════════════════════╝
   `);
 });
