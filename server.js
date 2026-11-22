@@ -125,7 +125,27 @@ async function sendVerificationEmail(to, code, businessName) {
     html,
   });
 }
-
+async function sendResetEmail(to, code, businessName) {
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+      <div style="background:#1A2A3A;color:#fff;padding:20px;text-align:center;border-radius:10px 10px 0 0">
+        <h1 style="margin:0">★ AstarsD</h1>
+      </div>
+      <div style="background:#f5f5f5;padding:30px;border-radius:0 0 10px 10px">
+        <h2>Hello ${businessName || 'there'},</h2>
+        <p>We received a request to reset your password. Use this code:</p>
+        <div style="font-size:36px;font-weight:bold;color:#1A2A3A;text-align:center;padding:20px;background:#fff;border-radius:10px;margin:20px 0;letter-spacing:8px">${code}</div>
+        <p>This code expires in <strong>15 minutes</strong>.</p>
+        <p>If you didn't request this, you can ignore this email. Your password won't change.</p>
+      </div>
+    </div>`;
+  await transporter.sendMail({
+    from: `"AstarsD" <${process.env.EMAIL_USER}>`,
+    to,
+    subject: 'Reset your password - AstarsD',
+    html,
+  });
+}
 // ============ MODELS ============
 // NOTE: add the billing fields from models/User.additions.js to your User schema.
 
@@ -537,6 +557,66 @@ app.post('/api/auth/resend-code', async (req, res) => {
   } catch (error) {
     console.error('Resend code error:', error);
     res.status(500).json({ success: false, message: error.message });
+  }
+});
+// ---------- FORGOT / RESET PASSWORD ----------
+const crypto = require('crypto');
+const hashCode = (c) => crypto.createHash('sha256').update(String(c)).digest('hex');
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const user = email ? await User.findOne({ email }) : null;
+    if (user) {
+      const code = crypto.randomInt(100000, 1000000).toString();
+      user.resetCode = hashCode(code);
+      user.resetCodeExpires = Date.now() + 15 * 60 * 1000;
+      user.resetAttempts = 0;
+      await user.save();
+      sendResetEmail(user.email, code, user.businessName)
+        .catch(err => console.error('Reset email failed:', err));
+    }
+    // Same answer whether or not the email exists (prevents account guessing)
+    res.json({ success: true, message: 'If that email is registered, a reset code has been sent.' });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const { code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Email, code and new password are required' });
+    }
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+    }
+    const user = await User.findOne({ email });
+    const bad = () => res.status(400).json({ success: false, message: 'Invalid or expired code' });
+    if (!user || !user.resetCode || !user.resetCodeExpires) return bad();
+    if (Date.now() > user.resetCodeExpires || user.resetAttempts >= 5) return bad();
+
+    if (user.resetCode !== hashCode(code)) {
+      user.resetAttempts += 1;
+      await user.save();
+      return bad();
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.resetCode = null;
+    user.resetCodeExpires = null;
+    user.resetAttempts = 0;
+    user.isVerified = true; // they proved they own the email
+    await user.save();
+
+    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+    res.json({ success: true, message: 'Password updated', token, user: getUserResponse(user) });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
   }
 });
 
