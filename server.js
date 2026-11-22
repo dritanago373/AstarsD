@@ -87,6 +87,33 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+async function sendEmail({ to, subject, html }) {
+  if (process.env.RESEND_API_KEY) {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: process.env.EMAIL_FROM || 'AstarsD <onboarding@resend.dev>',
+        to: [to],
+        subject,
+        html,
+      }),
+    });
+    if (!res.ok) throw new Error(`Resend ${res.status}: ${await res.text()}`);
+    return;
+  }
+  // Fallback: old SMTP (works on a local computer, blocked on Render free)
+  await transporter.sendMail({
+    from: `"AstarsD" <${process.env.EMAIL_USER}>`,
+    to,
+    subject,
+    html,
+  });
+}
+
 async function sendVerificationEmail(to, code, businessName) {
   const html = `
     <!DOCTYPE html>
@@ -118,12 +145,7 @@ async function sendVerificationEmail(to, code, businessName) {
     </html>
   `;
 
-  await transporter.sendMail({
-    from: `"AstarsD" <${process.env.EMAIL_USER}>`,
-    to,
-    subject: 'Verify Your Email - AstarsD',
-    html,
-  });
+  await sendEmail({ to, subject: 'Verify Your Email - AstarsD', html });
 }
 async function sendResetEmail(to, code, businessName) {
   const html = `
@@ -139,12 +161,7 @@ async function sendResetEmail(to, code, businessName) {
         <p>If you didn't request this, you can ignore this email. Your password won't change.</p>
       </div>
     </div>`;
-  await transporter.sendMail({
-    from: `"AstarsD" <${process.env.EMAIL_USER}>`,
-    to,
-    subject: 'Reset your password - AstarsD',
-    html,
-  });
+  await sendEmail({ to, subject: 'Reset your password - AstarsD', html });
 }
 // ============ MODELS ============
 // NOTE: add the billing fields from models/User.additions.js to your User schema.
@@ -561,12 +578,13 @@ app.post('/api/auth/resend-code', async (req, res) => {
 });
 // ---------- FORGOT / RESET PASSWORD ----------
 const crypto = require('crypto');
+const findUserByEmail = (email) => User.findOne({ email: new RegExp('^' + email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
 const hashCode = (c) => crypto.createHash('sha256').update(String(c)).digest('hex');
 
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const email = String(req.body.email || '').trim().toLowerCase();
-    const user = email ? await User.findOne({ email }) : null;
+    const user = email ? await findUserByEmail(email) : null;
     if (user) {
       const code = crypto.randomInt(100000, 1000000).toString();
       user.resetCode = hashCode(code);
@@ -594,7 +612,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     if (String(newPassword).length < 6) {
       return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
     }
-    const user = await User.findOne({ email });
+    const user = await findUserByEmail(email);
     const bad = () => res.status(400).json({ success: false, message: 'Invalid or expired code' });
     if (!user || !user.resetCode || !user.resetCodeExpires) return bad();
     if (Date.now() > user.resetCodeExpires || user.resetAttempts >= 5) return bad();
