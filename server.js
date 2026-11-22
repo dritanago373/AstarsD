@@ -723,6 +723,10 @@ app.delete('/api/businesses/:id', auth, async (req, res) => {
   try {
     const business = await Business.findOne({ _id: req.params.id, userId: req.user._id });
     if (!business) return res.status(404).json({ success: false, message: 'Business not found' });
+    // Remove the business together with its reviews and replies (so nothing is left orphaned)
+    const reviewIds = (await Review.find({ businessId: business._id, userId: req.user._id }).select('_id')).map((r) => r._id);
+    await Reply.deleteMany({ reviewId: { $in: reviewIds } });
+    await Review.deleteMany({ _id: { $in: reviewIds } });
     await business.deleteOne();
     res.json({ success: true, message: 'Business deleted' });
   } catch (error) {
@@ -932,9 +936,17 @@ app.post('/api/reviews', auth, checkAccess, async (req, res) => {
 
 app.get('/api/reviews/pending', auth, async (req, res) => {
   try {
-    const reviews = await Review.find({ userId: req.user._id, status: 'waiting_approval' })
+    const allPending = await Review.find({ userId: req.user._id, status: 'waiting_approval' })
       .populate('businessId', 'name')
       .sort({ createdAt: -1 });
+
+    // Clean up leftovers from businesses that were deleted earlier (their business no longer exists)
+    const orphanIds = allPending.filter((r) => !r.businessId).map((r) => r._id);
+    if (orphanIds.length) {
+      await Reply.deleteMany({ reviewId: { $in: orphanIds } });
+      await Review.deleteMany({ _id: { $in: orphanIds } });
+    }
+    const reviews = allPending.filter((r) => r.businessId);
 
     const reviewsWithReplies = await Promise.all(reviews.map(async (review) => {
       const reply = await Reply.findOne({ reviewId: review._id });
