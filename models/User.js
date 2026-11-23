@@ -42,6 +42,10 @@ const UserSchema = new mongoose.Schema({
 
   // ---- Email alerts when new reviews arrive ----
   emailNotifications: { type: Boolean, default: true },
+
+  // ---- AI reply style ----
+  replyTone: { type: String, default: 'Professional' },
+  replyLength: { type: String, default: 'Medium' },
 });
 
 module.exports = mongoose.model('User', UserSchema); // 👈 THIS LINE IS CRITICAL

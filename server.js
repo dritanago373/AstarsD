@@ -278,6 +278,8 @@ const getUserResponse = (user) => {
     monthlyLimit: user.monthlyLimit,
     preferredLanguage: user.preferredLanguage,
     emailNotifications: user.emailNotifications !== false,
+    replyTone: user.replyTone || 'Professional',
+    replyLength: user.replyLength || 'Medium',
   };
 };
 
@@ -309,9 +311,23 @@ function detectLanguage(text) {
   return detected;
 }
 
-async function generateAIReply(reviewContent, rating, language = 'en-US') {
+const REPLY_TONES = {
+  Professional: 'Use a professional, polished tone.',
+  Friendly: 'Use a warm, friendly and personable tone.',
+  Formal: 'Use a formal, respectful and courteous tone.',
+  Casual: 'Use a relaxed, casual and conversational tone.',
+};
+const REPLY_LENGTHS = {
+  Short: { words: 50, text: 'Keep it very short: 1 to 2 sentences, under 50 words.', tokens: 120 },
+  Medium: { words: 100, text: 'Keep it medium length: about 3 to 4 sentences, under 100 words.', tokens: 220 },
+  Long: { words: 150, text: 'Write a fuller reply of about 5 to 7 sentences, under 150 words.', tokens: 320 },
+};
+
+async function generateAIReply(reviewContent, rating, language = 'en-US', style = {}) {
   try {
     const languageInstruction = LANGUAGE_PROMPTS[language] || LANGUAGE_PROMPTS['en-US'];
+    const styleTone = REPLY_TONES[style.replyTone] || REPLY_TONES.Professional;
+    const styleLength = REPLY_LENGTHS[style.replyLength] || REPLY_LENGTHS.Medium;
     let toneInstruction = '';
     if (rating >= 4) toneInstruction = 'Write a warm, appreciative reply thanking the customer for their positive feedback.';
     else if (rating >= 3) toneInstruction = 'Write a balanced reply acknowledging their feedback and showing appreciation.';
@@ -323,8 +339,9 @@ Review: "${reviewContent}"
 Instructions:
 - ${toneInstruction}
 - Address the reviewer's specific points
-- Keep it under 150 words
-- Be professional and genuine
+- ${styleLength.text}
+- ${styleTone}
+- Be genuine
 - ${languageInstruction}
 - IMPORTANT: The reply MUST be in the same language as the review
 
@@ -336,7 +353,7 @@ Reply:`;
         { role: 'system', content: `You are a professional customer service representative. You write replies in the EXACT SAME LANGUAGE as the review you're responding to. ${languageInstruction}` },
         { role: 'user', content: prompt }
       ],
-      max_tokens: 300,
+      max_tokens: styleLength.tokens + 80,
       temperature: 0.7
     });
     return { success: true, content: response.choices[0].message.content.trim(), language };
@@ -781,6 +798,26 @@ app.put('/api/user/notifications', auth, async (req, res) => {
   }
 });
 
+app.put('/api/user/reply-style', auth, async (req, res) => {
+  try {
+    const { replyTone, replyLength } = req.body;
+    const user = await User.findById(req.user._id);
+    if (replyTone !== undefined) {
+      if (!REPLY_TONES[replyTone]) return res.status(400).json({ success: false, message: 'Invalid tone' });
+      user.replyTone = replyTone;
+    }
+    if (replyLength !== undefined) {
+      if (!REPLY_LENGTHS[replyLength]) return res.status(400).json({ success: false, message: 'Invalid length' });
+      user.replyLength = replyLength;
+    }
+    await user.save();
+    res.json({ success: true, user: getUserResponse(user) });
+  } catch (error) {
+    console.error('Reply style error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // REMOVED (security): PUT /api/user/upgrade, POST /api/user/subscribe, POST /api/user/unsubscribe.
 // They let any logged-in user grant themselves a paid plan for free. Plans now change only through
 // payment webhooks (routes/payments.js) and /api/user/subscription/* (routes/subscription.js).
@@ -938,63 +975,69 @@ app.get('/api/places/search', auth, placeSearchLimiter, async (req, res) => {
   }
 });
 
+// ---------- SYNC (used by the button and by the automatic timer) ----------
+async function syncBusinessReviews(user, business) {
+  const externalReviews = await fetchExternalReviews(business);
+  let newReviewsCount = 0;
+
+  for (const extReview of externalReviews) {
+    const existing = await Review.findOne({ externalReviewId: extReview.externalReviewId });
+    if (existing) continue;
+
+    const detectedLanguage = detectLanguage(extReview.content);
+
+    const review = new Review({
+      userId: user._id,
+      businessId: business._id,
+      reviewerName: extReview.reviewerName,
+      reviewerEmail: extReview.reviewerEmail || '',
+      rating: extReview.rating || 0,
+      content: extReview.content || '',
+      platform: extReview.platform || business.platform,
+      contentLanguage: detectedLanguage,
+      externalReviewId: extReview.externalReviewId,
+      googleReviewName: extReview.googleReviewName,
+      status: 'pending'
+    });
+
+    const fraudResult = detectFakeReviewer(review);
+    review.fraudScore = fraudResult.score;
+    review.isFake = fraudResult.isFake;
+
+    await review.save();
+    newReviewsCount++;
+
+    const aiReply = await generateAIReply(review.content, review.rating, detectedLanguage, user);
+    const reply = new Reply({
+      reviewId: review._id,
+      userId: user._id,
+      draft: aiReply.content,
+      language: detectedLanguage,
+      status: 'draft'
+    });
+    await reply.save();
+
+    review.status = 'waiting_approval';
+    await review.save();
+  }
+
+  business.lastSyncedAt = new Date();
+  await business.save();
+
+  if (newReviewsCount > 0 && user.emailNotifications !== false) {
+    sendNewReviewsEmail(user.email, newReviewsCount, user.businessName, business.name)
+      .catch((err) => console.error('New-reviews email failed:', err));
+  }
+  return newReviewsCount;
+}
+
 // ---------- SYNC ROUTE (now requires trial or subscription: it calls OpenAI) ----------
 app.post('/api/businesses/:id/sync', auth, checkAccess, async (req, res) => {
   try {
     const business = await Business.findOne({ _id: req.params.id, userId: req.user._id });
     if (!business) return res.status(404).json({ success: false, message: 'Business not found' });
 
-    const externalReviews = await fetchExternalReviews(business);
-    let newReviewsCount = 0;
-
-    for (const extReview of externalReviews) {
-      const existing = await Review.findOne({ externalReviewId: extReview.externalReviewId });
-      if (existing) continue;
-
-      const detectedLanguage = detectLanguage(extReview.content);
-
-      const review = new Review({
-        userId: req.user._id,
-        businessId: business._id,
-        reviewerName: extReview.reviewerName,
-        reviewerEmail: extReview.reviewerEmail || '',
-        rating: extReview.rating || 0,
-        content: extReview.content || '',
-        platform: extReview.platform || business.platform,
-        contentLanguage: detectedLanguage,
-        externalReviewId: extReview.externalReviewId,
-        googleReviewName: extReview.googleReviewName,
-        status: 'pending'
-      });
-
-      const fraudResult = detectFakeReviewer(review);
-      review.fraudScore = fraudResult.score;
-      review.isFake = fraudResult.isFake;
-
-      await review.save();
-      newReviewsCount++;
-
-      const aiReply = await generateAIReply(review.content, review.rating, detectedLanguage);
-      const reply = new Reply({
-        reviewId: review._id,
-        userId: req.user._id,
-        draft: aiReply.content,
-        language: detectedLanguage,
-        status: 'draft'
-      });
-      await reply.save();
-
-      review.status = 'waiting_approval';
-      await review.save();
-    }
-
-    business.lastSyncedAt = new Date();
-    await business.save();
-
-    if (newReviewsCount > 0 && req.user.emailNotifications !== false) {
-      sendNewReviewsEmail(req.user.email, newReviewsCount, req.user.businessName, business.name)
-        .catch((err) => console.error('New-reviews email failed:', err));
-    }
+    const newReviewsCount = await syncBusinessReviews(req.user, business);
 
     res.json({
       success: true,
@@ -1005,6 +1048,52 @@ app.post('/api/businesses/:id/sync', auth, checkAccess, async (req, res) => {
     console.error('Sync error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
+});
+
+// ---------- AUTOMATIC SYNC (called by an outside timer, e.g. cron-job.org) ----------
+// Protected by CRON_SECRET. Answers at once and works in the background so the timer never times out.
+let autoSyncRunning = false;
+const cronAuth = (req, res, next) => {
+  const secret = process.env.CRON_SECRET;
+  const provided = req.get('x-cron-secret') || String(req.query.key || '');
+  if (!secret || !safeEqual(provided, secret)) {
+    return res.status(401).json({ success: false, message: 'Unauthorized' });
+  }
+  next();
+};
+
+async function runAutoSync() {
+  if (autoSyncRunning) return;
+  autoSyncRunning = true;
+  let businessesDone = 0, newTotal = 0;
+  try {
+    const now = new Date();
+    const users = await User.find({ isVerified: true });
+    for (const user of users) {
+      const trialOk = user.trialEnds && user.trialEnds > now;
+      if (!hasActiveSubscription(user) && !trialOk) continue;
+      const businesses = await Business.find({ userId: user._id });
+      for (const business of businesses) {
+        try {
+          newTotal += await syncBusinessReviews(user, business);
+          businessesDone++;
+        } catch (err) {
+          console.error(`Auto-sync failed for business ${business._id}:`, err.message);
+        }
+      }
+    }
+    console.log(`Auto-sync finished: ${businessesDone} businesses, ${newTotal} new reviews`);
+  } catch (err) {
+    console.error('Auto-sync error:', err);
+  } finally {
+    autoSyncRunning = false;
+  }
+}
+
+app.all('/api/cron/sync-all', cronAuth, (req, res) => {
+  if (autoSyncRunning) return res.status(202).json({ success: true, message: 'Auto-sync already running' });
+  runAutoSync();
+  res.status(202).json({ success: true, message: 'Auto-sync started' });
 });
 
 // ---------- REVIEW ROUTES ----------
@@ -1035,7 +1124,7 @@ app.post('/api/reviews', auth, checkAccess, async (req, res) => {
     review.isFake = fraudResult.isFake;
     await review.save();
 
-    const aiReply = await generateAIReply(content, rating, detectedLanguage);
+    const aiReply = await generateAIReply(content, rating, detectedLanguage, req.user);
     const reply = new Reply({
       reviewId: review._id,
       userId: req.user._id,
@@ -1206,7 +1295,7 @@ app.post('/api/replies/:id/regenerate', auth, async (req, res) => {
     const review = await Review.findById(reply.reviewId);
     if (!review) return res.status(404).json({ success: false, message: 'Review not found' });
     const targetLanguage = req.body.language || review.contentLanguage || 'en-US';
-    const newReply = await generateAIReply(review.content, review.rating, targetLanguage);
+    const newReply = await generateAIReply(review.content, review.rating, targetLanguage, req.user);
     reply.draft = newReply.content;
     reply.language = targetLanguage;
     reply.status = 'draft';
@@ -1319,7 +1408,7 @@ app.post('/api/webhook/review', async (req, res) => {
     review.isFake = fraudResult.isFake;
     await review.save();
 
-    const aiReply = await generateAIReply(data.content, data.rating, detectedLanguage);
+    const aiReply = await generateAIReply(data.content, data.rating, detectedLanguage, user);
     const reply = new Reply({
       reviewId: review._id,
       userId: user._id,
