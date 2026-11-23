@@ -163,6 +163,23 @@ async function sendResetEmail(to, code, businessName) {
     </div>`;
   await sendEmail({ to, subject: 'Reset your password - AstarsD', html });
 }
+async function sendNewReviewsEmail(to, count, businessName, bizName) {
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+      <div style="background:#1A2A3A;color:#fff;padding:20px;text-align:center;border-radius:10px 10px 0 0">
+        <h1 style="margin:0">&#9733; AstarsD</h1>
+      </div>
+      <div style="background:#f5f5f5;padding:30px;border-radius:0 0 10px 10px">
+        <h2>Hello ${businessName || 'there'},</h2>
+        <p>You have <strong>${count} new review${count === 1 ? '' : 's'}</strong> for <strong>${bizName}</strong> with AI replies ready for your approval.</p>
+        <p style="text-align:center;margin:28px 0">
+          <a href="https://astarsdapp.vercel.app" style="background:#1A2A3A;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:bold">Review and approve</a>
+        </p>
+        <p style="color:#888;font-size:12px">You can turn these emails off any time in the app: Settings, Preferences, Email notifications.</p>
+      </div>
+    </div>`;
+  await sendEmail({ to, subject: `${count} new review${count === 1 ? '' : 's'} waiting - AstarsD`, html });
+}
 // ============ MODELS ============
 // NOTE: add the billing fields from models/User.additions.js to your User schema.
 
@@ -260,6 +277,7 @@ const getUserResponse = (user) => {
     repliesUsed: user.repliesUsed,
     monthlyLimit: user.monthlyLimit,
     preferredLanguage: user.preferredLanguage,
+    emailNotifications: user.emailNotifications !== false,
   };
 };
 
@@ -751,6 +769,18 @@ app.put('/api/user/business-name', auth, async (req, res) => {
   }
 });
 
+app.put('/api/user/notifications', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    user.emailNotifications = !!req.body.emailNotifications;
+    await user.save();
+    res.json({ success: true, user: getUserResponse(user) });
+  } catch (error) {
+    console.error('Notifications update error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // REMOVED (security): PUT /api/user/upgrade, POST /api/user/subscribe, POST /api/user/unsubscribe.
 // They let any logged-in user grant themselves a paid plan for free. Plans now change only through
 // payment webhooks (routes/payments.js) and /api/user/subscription/* (routes/subscription.js).
@@ -960,6 +990,11 @@ app.post('/api/businesses/:id/sync', auth, checkAccess, async (req, res) => {
 
     business.lastSyncedAt = new Date();
     await business.save();
+
+    if (newReviewsCount > 0 && req.user.emailNotifications !== false) {
+      sendNewReviewsEmail(req.user.email, newReviewsCount, req.user.businessName, business.name)
+        .catch((err) => console.error('New-reviews email failed:', err));
+    }
 
     res.json({
       success: true,

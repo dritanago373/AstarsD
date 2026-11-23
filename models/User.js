@@ -9,9 +9,6 @@ const UserSchema = new mongoose.Schema({
   isVerified: { type: Boolean, default: false },
   verificationCode: { type: String },
   verificationCodeExpires: { type: Date },
-  resetCode: { type: String },
-  resetCodeExpires: { type: Date },
-  resetAttempts: { type: Number, default: 0 },
   pendingEmail: { type: String },
   pendingEmailCode: { type: String },
   pendingEmailCodeExpires: { type: Date },
@@ -37,6 +34,14 @@ const UserSchema = new mongoose.Schema({
   paddleSubscriptionId: { type: String, default: null, index: true },
   cancelAtPeriodEnd: { type: Boolean, default: false },
   billingEventAt: { type: Date, default: null },   // lets webhooks ignore out-of-order events
+
+  // ---- Password reset ----
+  resetCode: { type: String },
+  resetCodeExpires: { type: Date },
+  resetAttempts: { type: Number, default: 0 },
+
+  // ---- Email alerts when new reviews arrive ----
+  emailNotifications: { type: Boolean, default: true },
 });
 
 module.exports = mongoose.model('User', UserSchema); // 👈 THIS LINE IS CRITICAL
