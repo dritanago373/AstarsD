@@ -129,7 +129,7 @@ async function sendVerificationEmail(to, code, businessName) {
     </head>
     <body>
       <div class="header">
-        <h1>🌍 AstarsD</h1>
+        <h1>&#9733; AstarsD</h1>
       </div>
       <div class="content">
         <h2>Hello ${businessName || 'there'}! 👋</h2>
@@ -139,7 +139,7 @@ async function sendVerificationEmail(to, code, businessName) {
         <p>If you didn't request this, please ignore this email.</p>
       </div>
       <div class="footer">
-        <p>© 2024 AstarsD. All rights reserved.</p>
+        <p>© 2026 AstarsD. All rights reserved.</p>
       </div>
     </body>
     </html>

@@ -11,7 +11,7 @@ const PLAN_ORDER = ['single', 'pro', 'business'];
 const PLAN_PRICE_IDS = {
   single: process.env.PADDLE_PRICE_SINGLE || 'pri_01m7h6qgxxqtn1656y3e5x0rxg',
   pro: process.env.PADDLE_PRICE_PRO || 'pri_01m7h71hhftxpz7bjav7h41bhn',
-  business: process.env.PADDLE_PRICE_BUSINESS || 'pri_01m7h7594ksd8q777pd4z77y9q',
+  business: process.env.PADDLE_PRICE_BUSINESS || 'pri_01m85ke89kee6ansb19a5kgzb5',
 };
 const PRICE_TO_PLAN = Object.fromEntries(Object.entries(PLAN_PRICE_IDS).map(([plan, id]) => [id, plan]));
 
@@ -90,13 +90,32 @@ function clearSubscription(user) {
   user.plan = 'single';
 }
 
+// Decide which plan a Paddle subscription is. Several independent checks, so a new/changed
+// price id in Paddle can never silently leave the customer on the wrong plan.
+const AMOUNT_TO_PLAN = { 1500: 'single', 3000: 'pro', 7900: 'business' }; // cents
+function detectPlan(sub, user) {
+  const item = sub.items?.[0];
+  const price = item?.price;
+  // 1) known price id
+  if (price?.id && PRICE_TO_PLAN[price.id]) return PRICE_TO_PLAN[price.id];
+  // 2) plan chosen in the app at checkout (custom_data is copied from the transaction to the subscription)
+  const fromData = sub.custom_data?.planId;
+  if (PLAN_ORDER.includes(fromData)) return fromData;
+  // 3) price name or amount in Paddle
+  const label = String(price?.name || price?.description || item?.product?.name || '').toLowerCase();
+  for (const p of PLAN_ORDER) if (label.includes(p)) return p;
+  const amount = Number(price?.unit_price?.amount);
+  if (AMOUNT_TO_PLAN[amount]) return AMOUNT_TO_PLAN[amount];
+  console.warn(`[billing] Unknown Paddle price ${price?.id} (${price?.name}, ${price?.unit_price?.amount}) - keeping plan ${user.plan}`);
+  return user.plan || 'single';
+}
+
 // sub = a Paddle subscription entity (webhook data, or API response)
 function applyPaddleSubscription(user, sub) {
   // Ignore events for an old subscription once the user has a newer one
   if (user.paddleSubscriptionId && sub.id && user.paddleSubscriptionId !== sub.id && sub.status === 'canceled') return;
 
-  const priceId = sub.items?.[0]?.price?.id;
-  const plan = PRICE_TO_PLAN[priceId] || user.plan || 'single';
+  const plan = detectPlan(sub, user);
 
   user.billingProvider = 'paddle';
   user.paddleCustomerId = sub.customer_id || user.paddleCustomerId;
@@ -109,6 +128,7 @@ function applyPaddleSubscription(user, sub) {
 
   // active | trialing | past_due (Paddle retries payment, so keep access during past_due)
   user.isSubscribed = true;
+  console.log(`[billing] Paddle price ${sub.items?.[0]?.price?.id} -> plan ${plan}`);
   user.plan = plan;
   user.subscriptionPlan = plan;
   if (!user.subscriptionStart) user.subscriptionStart = sub.started_at ? new Date(sub.started_at) : new Date();
