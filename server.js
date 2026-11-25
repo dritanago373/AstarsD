@@ -348,7 +348,7 @@ Instructions:
 Reply:`;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4',
+      model: 'gpt-4-mini',
       messages: [
         { role: 'system', content: `You are a professional customer service representative. You write replies in the EXACT SAME LANGUAGE as the review you're responding to. ${languageInstruction}` },
         { role: 'user', content: prompt }
