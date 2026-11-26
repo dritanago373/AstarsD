@@ -173,7 +173,7 @@ async function sendNewReviewsEmail(to, count, businessName, bizName) {
         <h2>Hello ${businessName || 'there'},</h2>
         <p>You have <strong>${count} new review${count === 1 ? '' : 's'}</strong> for <strong>${bizName}</strong> with AI replies ready for your approval.</p>
         <p style="text-align:center;margin:28px 0">
-          <a href="https://astarsdapp.vercel.app" style="background:#1A2A3A;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:bold">Review and approve</a>
+          <a href="https://app.astarsd.app" style="background:#1A2A3A;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:bold">Review and approve</a>
         </p>
         <p style="color:#888;font-size:12px">You can turn these emails off any time in the app: Settings, Preferences, Email notifications.</p>
       </div>
