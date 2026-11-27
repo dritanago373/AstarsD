@@ -541,7 +541,7 @@ app.post('/api/auth/register', async (req, res) => {
     const user = new User({
       email,
       password: hashedPassword,
-      businessName,
+      businessName: String(businessName || '').trim() || String(email).split('@')[0],
       phone,
       preferredLanguage: preferredLanguage || 'en-US',
       plan: 'single',
@@ -705,6 +705,54 @@ app.post('/api/auth/login', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ---------- CONTINUE WITH GOOGLE (sign in / sign up with a Google account) ----------
+// The app sends the Google ID token ("credential"). We ask Google to check it, then log the user in.
+const GOOGLE_SIGNIN_CLIENT_ID =
+  process.env.GOOGLE_OAUTH_CLIENT_ID || '994987200360-jj51kfoop7auvj7h26ofs66mfmc4bgt6.apps.googleusercontent.com';
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const credential = String(req.body.credential || '');
+    if (!credential) return res.status(400).json({ success: false, message: 'Google sign-in failed. Please try again.' });
+
+    const check = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential));
+    const info = await check.json();
+    if (!check.ok || info.aud !== GOOGLE_SIGNIN_CLIENT_ID || String(info.email_verified) !== 'true' || !info.email) {
+      return res.status(401).json({ success: false, message: 'Google sign-in failed. Please try again.' });
+    }
+
+    const email = String(info.email).trim().toLowerCase();
+    let user = await findUserByEmail(email);
+    let isNew = false;
+
+    if (!user) {
+      isNew = true;
+      const randomPassword = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
+      user = new User({
+        email,
+        password: randomPassword,
+        businessName: String(req.body.businessName || '').trim() || info.name || email.split('@')[0],
+        preferredLanguage: 'en-US',
+        plan: 'single',
+        isVerified: true,
+        trialEnds: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
+      });
+      await user.save();
+    } else if (!user.isVerified) {
+      user.isVerified = true;
+      user.verificationCode = null;
+      user.verificationCodeExpires = null;
+      await user.save();
+    }
+
+    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+    res.json({ success: true, token, isNew, user: getUserResponse(user) });
+  } catch (error) {
+    console.error('Google sign-in error:', error);
+    res.status(500).json({ success: false, message: 'Google sign-in failed. Please try again.' });
   }
 });
 
