@@ -1410,13 +1410,13 @@ app.get('/api/languages', (req, res) => {
 });
 
 // ---------- PLANS ----------
-// NOTE: these prices/features differ from the app (15 / 30 / 50 USD). Align them if the app uses this endpoint.
+// Prices and features match the app (15 / 30 / 79 USD per month).
 app.get('/api/plans', async (req, res) => {
   try {
     const plans = [
-      { id: 'single', name: 'Single Business', price: 0, currency: 'USD', features: ['1 business', '50 replies/month', 'All 11 languages', 'AI fraud detection'] },
-      { id: 'pro', name: 'Pro', price: 9.99, currency: 'USD', features: ['5 businesses', 'Unlimited replies', 'All 11 languages', 'Priority support', 'Advanced analytics'] },
-      { id: 'business', name: 'Business', price: 19.99, currency: 'USD', features: ['Unlimited businesses', 'Unlimited replies', 'All 11 languages', 'Priority support', 'Advanced analytics', 'Custom branding'] }
+      { id: 'single', name: 'Single', price: 15, currency: 'USD', features: ['1 Business', 'Unlimited Replies', 'All Languages', 'Email Support'] },
+      { id: 'pro', name: 'Pro', price: 30, currency: 'USD', features: ['5 Businesses', 'Unlimited Replies', 'All Languages', 'Priority Support'] },
+      { id: 'business', name: 'Business', price: 79, currency: 'USD', features: ['Unlimited Businesses', 'Unlimited Replies', 'All Languages', '24/7 Support'] }
     ];
     res.json({ success: true, data: plans });
   } catch (error) {
