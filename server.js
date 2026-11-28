@@ -231,6 +231,15 @@ const Reply = mongoose.model('Reply', ReplySchema);
 
 // ============ MIDDLEWARE ============
 
+// Free-trial users can create a limited number of replies (paid users: no limit)
+const TRIAL_REPLY_LIMIT = 20;
+const trialLimitReached = async (user) => {
+  if (hasActiveSubscription(user)) return false;
+  const used = await Reply.countDocuments({ userId: user._id });
+  return used >= TRIAL_REPLY_LIMIT;
+};
+const TRIAL_LIMIT_MESSAGE = `You have used all ${TRIAL_REPLY_LIMIT} replies included in your free trial. Please subscribe to continue.`;
+
 const checkAccess = async (req, res, next) => {
   const user = req.user;
 
@@ -1032,6 +1041,9 @@ async function syncBusinessReviews(user, business) {
     const existing = await Review.findOne({ externalReviewId: extReview.externalReviewId });
     if (existing) continue;
 
+    // Trial limit reached: stop here. These reviews are picked up after the user subscribes.
+    if (await trialLimitReached(user)) break;
+
     const detectedLanguage = detectLanguage(extReview.content);
 
     const review = new Review({
@@ -1154,6 +1166,10 @@ app.post('/api/reviews', auth, checkAccess, async (req, res) => {
     const business = await Business.findOne({ _id: businessId, userId: req.user._id });
     if (!business) {
       return res.status(404).json({ success: false, message: 'Business not found or unauthorized' });
+    }
+
+    if (await trialLimitReached(req.user)) {
+      return res.status(403).json({ success: false, message: TRIAL_LIMIT_MESSAGE, trialLimitReached: true });
     }
 
     const detectedLanguage = detectLanguage(content);
@@ -1342,6 +1358,9 @@ app.post('/api/replies/:id/regenerate', auth, async (req, res) => {
     if (reply.userId.toString() !== req.user._id.toString()) return res.status(403).json({ success: false, message: 'Unauthorized' });
     const review = await Review.findById(reply.reviewId);
     if (!review) return res.status(404).json({ success: false, message: 'Review not found' });
+    if (await trialLimitReached(req.user)) {
+      return res.status(403).json({ success: false, message: TRIAL_LIMIT_MESSAGE, trialLimitReached: true });
+    }
     const targetLanguage = req.body.language || review.contentLanguage || 'en-US';
     const newReply = await generateAIReply(review.content, review.rating, targetLanguage, req.user);
     reply.draft = newReply.content;
@@ -1486,7 +1505,7 @@ app.listen(PORT, '0.0.0.0', () => {
 ╔══════════════════════════════════════════════════════════════╗
 ║   🌍 AstarsD SYSTEM                                          ║
 ║   🤖 AI AUTO-REPLIES IN 11 LANGUAGES                         ║
-║   🌐 Live at: https://astarsd.onrender.com                        ║
+║   🌐 Live at: https://astarsd.onrender.com                   ║
 ║   ✉️  Emails from: ${process.env.EMAIL_USER || 'support@astarsd.app'}   ║
 ║   📅 Status: RUNNING                                         ║
 ║   💳 Subscriptions: Paddle + App Store + Google Play         ║
