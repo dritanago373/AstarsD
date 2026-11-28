@@ -176,8 +176,18 @@ async function fetchLinkedReviews(business) {
     business.userId,
     `https://mybusiness.googleapis.com/v4/${base}/reviews?pageSize=50&orderBy=updateTime%20desc`
   );
-  return (data.reviews || [])
+  const time = (r) => new Date(r.createTime || r.updateTime || 0).getTime();
+  const unanswered = (data.reviews || [])
     .filter((r) => !r.reviewReply) // already answered on Google
+    .sort((a, b) => time(b) - time(a)); // newest first
+
+  // Only reviews from the last 90 days. A quiet business with fewer than 5 recent
+  // reviews still gets its 5 most recent unanswered ones, so it never looks empty.
+  const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+  const recent = unanswered.filter((r) => time(r) >= cutoff);
+  const chosen = recent.length >= 5 ? recent : unanswered.slice(0, 5);
+
+  return chosen
     .map((r) => ({
       externalReviewId: `google_${r.reviewId}`,
       googleReviewName: r.name, // accounts/X/locations/Y/reviews/Z
