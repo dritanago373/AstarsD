@@ -1486,7 +1486,7 @@ app.listen(PORT, '0.0.0.0', () => {
 ╔══════════════════════════════════════════════════════════════╗
 ║   🌍 AstarsD SYSTEM                                          ║
 ║   🤖 AI AUTO-REPLIES IN 11 LANGUAGES                         ║
-║   🌐 Live at: https://api.astarsd.app                        ║
+║   🌐 Live at: https://astarsd.onrender.com                        ║
 ║   ✉️  Emails from: ${process.env.EMAIL_USER || 'support@astarsd.app'}   ║
 ║   📅 Status: RUNNING                                         ║
 ║   💳 Subscriptions: Paddle + App Store + Google Play         ║
